@@ -68,13 +68,20 @@ bool is_nvshmem_available() {
   return is_available == 1;
 }
 
-// Initializes the device state in CUmodule so that it’s able to perform NVSHMEM
-// operations.
+// Initializes the device state in CUmodule/hipModule_t so that it’s able to
+// perform NVSHMEM/rocSHMEM operations (populates ROCSHMEM_CTX_DEFAULT global).
 void nvshmemx_cumodule_init(uintptr_t module) {
+#if defined(USE_ROCM)
+  auto hipmodule = reinterpret_cast<hipModule_t>(module);
+  NVSHMEM_CHECK(
+    ::rocshmem_hipmodule_init(hipmodule),
+    "rocshmem_hipmodule_init failed");
+#else
   auto cumodule = reinterpret_cast<CUmodule>(module);
   NVSHMEM_CHECK(
     ::nvshmemx_cumodule_init(cumodule),
     "nvshmemx_cumodule_init failed");
+#endif
 }
 
 at::Tensor nvshmem_broadcast(at::Tensor& input, const int64_t root, const std::string& group_name) {
