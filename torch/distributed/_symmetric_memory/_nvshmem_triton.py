@@ -4,7 +4,6 @@ import subprocess
 import sysconfig
 from typing import Any
 
-import torch
 import torch.distributed as dist
 from torch.utils._triton import has_triton
 
@@ -177,195 +176,6 @@ def _nvshmem_init_hook(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
                 "Please report this issue to Triton."
             )
 
-
-# ---------------------------------------------------------------------------
-# rocSHMEM Triton integration (USE_ROCM)
-# All rocSHMEM-specific classes and decorators live here, guarded by the
-# torch.version.hip check so they never execute on CUDA builds.
-# ---------------------------------------------------------------------------
-
-if torch.version.hip is not None:
-
-    class RocshmemLibFinder:
-        """
-        Find the architecture-specific rocSHMEM device bitcode library.
-
-        Environment variable:
-            ``ROCSHMEM_LIB_DIR`` (Optional[str]): directory containing
-            ``librocshmem_device_{arch}.bc``.  When not set, the standard
-            ROCm installation at ``/opt/rocm/lib`` is searched.
-
-        Example::
-            export ROCSHMEM_LIB_DIR=/opt/rocm/lib
-        """
-
-        found_device_lib_path: str | None = None
-
-        @classmethod
-        def find_device_library(cls) -> str:
-            import os as _os
-            _pid = _os.getpid()
-            if cls.found_device_lib_path is not None:
-                print(f"[ROCSHMEM DEBUG pid={_pid}] RocshmemLibFinder: cached path={cls.found_device_lib_path}", flush=True)
-                return cls.found_device_lib_path
-
-            print(f"[ROCSHMEM DEBUG pid={_pid}] RocshmemLibFinder.find_device_library: checking cuda availability...", flush=True)
-            if not torch.cuda.is_available():
-                raise RuntimeError(
-                    "ROCm/CUDA not available — cannot detect GPU architecture"
-                )
-
-            props = torch.cuda.get_device_properties(0)
-            # gcnArchName returns e.g. "gfx942:sramecc+:xnack-"
-            arch = props.gcnArchName.split(":")[0]
-            print(f"[ROCSHMEM DEBUG pid={_pid}] RocshmemLibFinder: detected arch={arch}", flush=True)
-            logger.info("Detected GPU architecture: %s", arch)
-
-            lib_name = f"librocshmem_device_{arch}.bc"
-
-            user_lib_dir = os.environ.get("ROCSHMEM_LIB_DIR")
-            if user_lib_dir is not None:
-                lib_path = os.path.join(user_lib_dir, lib_name)
-                if not os.path.exists(lib_path):
-                    raise RuntimeError(
-                        f"rocSHMEM device library not found at ROCSHMEM_LIB_DIR: "
-                        f"{lib_path}"
-                    )
-                cls.found_device_lib_path = lib_path
-                print(f"[ROCSHMEM DEBUG pid={_pid}] RocshmemLibFinder: found via ROCSHMEM_LIB_DIR={lib_path}", flush=True)
-                return lib_path
-
-            search_paths = [
-                os.path.join(sysconfig.get_path("purelib"), "amd", "rocshmem", "lib"),
-                "/opt/rocm/lib",
-                "/opt/rocm-7.1.0/lib",
-                "/usr/local/lib",
-                "/usr/lib",
-            ]
-
-            for path in search_paths:
-                candidate = os.path.join(path, lib_name)
-                if os.path.exists(candidate):
-                    logger.info("Found rocSHMEM device library: %s", candidate)
-                    cls.found_device_lib_path = candidate
-                    print(f"[ROCSHMEM DEBUG pid={_pid}] RocshmemLibFinder: found at {candidate}", flush=True)
-                    return candidate
-
-            raise RuntimeError(
-                f"rocSHMEM device library '{lib_name}' not found.\n"
-                f"Searched: {search_paths}\n"
-                f"Set ROCSHMEM_LIB_DIR to the directory containing it."
-            )
-
-    class RocshmemKernelRegistry:
-        """Track Triton kernels that need rocSHMEM HIP-module initialization."""
-
-        _to_init: dict[str, Any] = {}
-
-        @classmethod
-        def register(cls, name: str) -> None:
-            cls._to_init.setdefault(name)
-
-        @classmethod
-        def deregister(cls, name: str) -> None:
-            cls._to_init.pop(name, None)
-
-        @classmethod
-        def has(cls, name: str) -> bool:
-            return name in cls._to_init
-
-    def _rocshmem_init_hook(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
-        """
-        Post-compile hook that initializes rocSHMEM device context in the
-        compiled HIP module.  Mirrors ``_nvshmem_init_hook`` but calls
-        ``_rocshmemx_hipmodule_init`` instead of ``_nvshmemx_cumodule_init``.
-        """
-        import os as _os
-        _pid = _os.getpid()
-        print(f"[ROCSHMEM DEBUG pid={_pid}] _rocshmem_init_hook: called", flush=True)
-
-        try:
-            from torch._C._distributed_c10d import _rocshmemx_hipmodule_init
-            print(f"[ROCSHMEM DEBUG pid={_pid}] _rocshmem_init_hook: _rocshmemx_hipmodule_init imported OK", flush=True)
-        except ImportError as e:
-            print(f"[ROCSHMEM DEBUG pid={_pid}] _rocshmem_init_hook: ImportError - {e}", flush=True)
-            raise RuntimeError(
-                "rocSHMEM C++ extension not found. "
-                "PyTorch must be built with USE_ROCM=1 and rocSHMEM installed."
-            ) from e
-
-        jit_function = kwargs["fn"].jit_function
-        fn_name = jit_function.fn.__name__
-        print(f"[ROCSHMEM DEBUG pid={_pid}] _rocshmem_init_hook: fn_name={fn_name}, registered={RocshmemKernelRegistry.has(fn_name)}", flush=True)
-
-        if not RocshmemKernelRegistry.has(fn_name):
-            return
-
-        key = kwargs["key"]
-        device = kwargs["compile"]["device"]
-        kernel_cache = jit_function.device_caches[device][0]
-        kernel = kernel_cache.get(key, None)
-        if kernel is not None:
-            kernel.run  # noqa: B018 — touch the JIT cache entry
-            print(f"[ROCSHMEM DEBUG pid={_pid}] _rocshmem_init_hook: calling _rocshmemx_hipmodule_init for {fn_name}...", flush=True)
-            _rocshmemx_hipmodule_init(kernel.module)
-            print(f"[ROCSHMEM DEBUG pid={_pid}] _rocshmem_init_hook: _rocshmemx_hipmodule_init returned OK for {fn_name}", flush=True)
-        else:
-            logger.warning(
-                "It seems Triton hasn't created a kernel for function %s. "
-                "Please report this issue to Triton.",
-                fn_name,
-            )
-            print(f"[ROCSHMEM DEBUG pid={_pid}] _rocshmem_init_hook: WARNING - no kernel found in cache for {fn_name}", flush=True)
-
-    if has_triton():
-        import triton
-
-        def requires_rocshmem(  # type: ignore[no-untyped-def]
-            jit_func,
-        ):
-            """
-            Decorator to mark a Triton kernel as requiring rocSHMEM device APIs.
-
-            Finds the architecture-specific rocSHMEM bitcode library, registers
-            the kernel for post-compile HIP-module initialization, and wraps the
-            function so that ``extern_libs`` is injected automatically.
-
-            Example::
-
-                @requires_rocshmem
-                @triton.jit
-                def my_kernel(...):
-                    pe = rocshmem_my_pe()
-                    rocshmem_putmem_wg(dest, src, nbytes, target_pe)
-
-            Set ``ROCSHMEM_LIB_DIR`` to override the default library search path.
-            """
-            from triton.runtime.jit import JITFunction
-
-            if not isinstance(jit_func, JITFunction):
-                raise TypeError(
-                    f"@requires_rocshmem must be applied to a @triton.jit function, "
-                    f"got {type(jit_func)}"
-                )
-
-            import os as _os
-            _pid = _os.getpid()
-            print(f"[ROCSHMEM DEBUG pid={_pid}] @requires_rocshmem: decorating {jit_func.fn.__name__}", flush=True)
-            lib_path = RocshmemLibFinder.find_device_library()
-            # Key must be a substring of the rocSHMEM device function names
-            # (e.g. "rocshmem_my_pe") so that amd.need_extern_lib() returns True
-            # and the bitcode is actually linked into the Triton kernel.
-            extern_libs = {"rocshmem": lib_path}
-            print(f"[ROCSHMEM DEBUG pid={_pid}] @requires_rocshmem: extern_libs={extern_libs}", flush=True)
-
-            RocshmemKernelRegistry.register(jit_func.fn.__name__)
-            triton.knobs.runtime.jit_post_compile_hook = _rocshmem_init_hook
-            print(f"[ROCSHMEM DEBUG pid={_pid}] @requires_rocshmem: registered {jit_func.fn.__name__}, hook set", flush=True)
-
-            return GridCallableWithExtern(jit_func, extern_libs)
-
-
 if has_triton():
     from triton.runtime.jit import JITFunction, KernelInterface
 
@@ -383,12 +193,8 @@ if has_triton():
             self.extern_libs = extern_libs
 
         def run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-            import os as _os
-            _pid = _os.getpid()
-            print(f"[ROCSHMEM DEBUG pid={_pid}] GridCallableWithExtern.run: starting JIT compilation/run for {self.jit_func.fn.__name__}", flush=True)
-            result = self.jit_func.run(*args, **kwargs, extern_libs=self.extern_libs)
-            print(f"[ROCSHMEM DEBUG pid={_pid}] GridCallableWithExtern.run: JIT run returned for {self.jit_func.fn.__name__}", flush=True)
-            return result
+            # Call the JITFunction.run with added extern_libs kwarg
+            return self.jit_func.run(*args, **kwargs, extern_libs=self.extern_libs)
 
 
 def requires_nvshmem(  # type: ignore[no-untyped-def]
@@ -436,21 +242,6 @@ def requires_nvshmem(  # type: ignore[no-untyped-def]
     return GridCallableWithExtern(jit_func, extern_libs)
 
 
-def _hip_device_api(nvshmem_name: str) -> str:
-    """Return the rocSHMEM device symbol name for *nvshmem_name* on ROCm.
-
-    On CUDA the name is returned unchanged.  On ROCm the mapping is looked up
-    in NVSHMEM_TO_ROCSHMEM_DEVICE_MAPPINGS from cuda_to_hip_mappings, which is
-    the canonical hipify source-of-truth for NVSHMEM → rocSHMEM API translation.
-    """
-    if torch.version.hip is None:
-        return nvshmem_name
-    from torch.utils.hipify.cuda_to_hip_mappings import (
-        NVSHMEM_TO_ROCSHMEM_DEVICE_MAPPINGS,
-    )
-    return NVSHMEM_TO_ROCSHMEM_DEVICE_MAPPINGS.get(nvshmem_name, nvshmem_name)
-
-
 if has_triton():
     import triton
     import triton.language as tl
@@ -493,7 +284,7 @@ if has_triton():
 
     @core.extern
     def putmem_block_extern_wrapper(dest, source, size_bytes, pe, _semantic=None):  # type: ignore[no-untyped-def]
-        """Low-level extern wrapper for NVSHMEM/rocSHMEM put"""
+        """Low-level extern wrapper for NVSHMEM put"""
         return core.extern_elementwise(
             "",
             "",
@@ -504,7 +295,7 @@ if has_triton():
                     core.dtype("int64"),  # source ptr
                     core.dtype("int64"),  # size in bytes
                     core.dtype("int32"),  # pe number
-                ): (_hip_device_api("nvshmemx_putmem_block"), core.dtype("int32"))
+                ): ("nvshmemx_putmem_block", core.dtype("int32"))
             },
             is_pure=False,
             _semantic=_semantic,
@@ -546,7 +337,7 @@ if has_triton():
 
     @core.extern
     def getmem_block_extern_wrapper(dest, source, size_bytes, pe, _semantic=None):  # type: ignore[no-untyped-def]
-        """Low-level extern wrapper for NVSHMEM/rocSHMEM get"""
+        """Low-level extern wrapper for NVSHMEM get"""
         return core.extern_elementwise(
             "",
             "",
@@ -557,7 +348,7 @@ if has_triton():
                     core.dtype("int64"),  # source ptr
                     core.dtype("int64"),  # size in bytes
                     core.dtype("int32"),  # pe number
-                ): (_hip_device_api("nvshmemx_getmem_block"), core.dtype("int32"))
+                ): ("nvshmemx_getmem_block", core.dtype("int32"))
             },
             is_pure=False,
             _semantic=_semantic,
@@ -600,7 +391,7 @@ if has_triton():
 
     @core.extern
     def getmem_nbi_block_extern_wrapper(dest, source, size_bytes, pe, _semantic=None):  # type: ignore[no-untyped-def]
-        """Low-level extern wrapper for NVSHMEM/rocSHMEM non-blocking get"""
+        """Low-level extern wrapper for NVSHMEM get"""
         return core.extern_elementwise(
             "",
             "",
@@ -611,7 +402,7 @@ if has_triton():
                     core.dtype("int64"),  # source ptr
                     core.dtype("int64"),  # size in bytes
                     core.dtype("int32"),  # pe number
-                ): (_hip_device_api("nvshmemx_getmem_nbi_block"), core.dtype("int32"))
+                ): ("nvshmemx_getmem_nbi_block", core.dtype("int32"))
             },
             is_pure=False,
             _semantic=_semantic,
@@ -702,7 +493,7 @@ if has_triton():
                     core.dtype("uint64"),
                     core.dtype("int32"),
                     core.dtype("int32"),
-                ): (_hip_device_api("nvshmemx_putmem_signal_block"), core.dtype("int32"))
+                ): ("nvshmemx_putmem_signal_block", core.dtype("int32"))
             },
             is_pure=False,
             _semantic=_semantic,
@@ -759,7 +550,7 @@ if has_triton():
                     core.dtype("int64"),
                     core.dtype("int32"),
                     core.dtype("int32"),
-                ): (_hip_device_api("nvshmem_int_wait_until"), core.dtype("int32"))
+                ): ("nvshmem_int_wait_until", core.dtype("int32"))
             },
             is_pure=False,
             _semantic=_semantic,
@@ -820,81 +611,63 @@ if has_triton():
                     core.dtype("int64"),
                     core.dtype("int32"),
                     core.dtype("uint64"),
-                ): (_hip_device_api("nvshmem_signal_wait_until"), core.dtype("int32"))
+                ): ("nvshmem_signal_wait_until", core.dtype("int32"))
             },
             is_pure=False,
             _semantic=_semantic,
         )
 
-    if torch.version.hip is None:
+    @core.extern
+    def signal_op(sig_addr, signal, sig_op, pe, _semantic=None):  # type: ignore[no-untyped-def]
+        """
+        Perform an atomic signal operation on a remote PE.
 
-        @core.extern
-        def signal_op(sig_addr, signal, sig_op, pe, _semantic=None):  # type: ignore[no-untyped-def]
-            """
-            Perform an atomic signal operation on a remote PE.
+        This function atomically updates a signal variable on the specified remote PE
+        using the given operation and value. This enables efficient point-to-point
+        synchronization and notification between PEs.
 
-            This function atomically updates a signal variable on the specified remote PE
-            using the given operation and value. This enables efficient point-to-point
-            synchronization and notification between PEs.
+        Args:
+            sig_addr (int64): Symmetric address of the signal variable (uint64_t) on the remote PE.
+                             Must be 8-byte aligned symmetric memory.
+            signal (int64): Value to be used in the signal operation.
+            sig_op (int32): Signal operation type. Common values:
+                           - NVSHMEM_SIGNAL_SET (0): Atomically set sig_addr = signal
+                           - NVSHMEM_SIGNAL_ADD (5): Atomically set sig_addr += signal
+            pe (int32): PE number of the remote PE (0 ≤ pe < nvshmem_n_pes()).
+            _semantic: Optional semantic information for Triton compilation.
 
-            Args:
-                sig_addr (int64): Symmetric address of the signal variable (uint64_t) on the remote PE.
-                                 Must be 8-byte aligned symmetric memory.
-                signal (int64): Value to be used in the signal operation.
-                sig_op (int32): Signal operation type. Common values:
-                               - NVSHMEM_SIGNAL_SET (0): Atomically set sig_addr = signal
-                               - NVSHMEM_SIGNAL_ADD (5): Atomically set sig_addr += signal
-                pe (int32): PE number of the remote PE (0 ≤ pe < nvshmem_n_pes()).
-                _semantic: Optional semantic information for Triton compilation.
+        Returns:
+            int32: Status code (0 for success).
 
-            Returns:
-                int32: Status code (0 for success).
+        Notes:
+            - This is a one-sided operation - the remote PE does not need to participate.
+            - The signal operation is performed atomically on the remote PE.
+            - Can be used with signal_wait_until() on the remote PE for synchronization.
+            - Provides low-overhead notification mechanism between PEs.
+            - The signal variable must be of type uint64_t in symmetric memory.
 
-            Notes:
-                - This is a one-sided operation - the remote PE does not need to participate.
-                - The signal operation is performed atomically on the remote PE.
-                - Can be used with signal_wait_until() on the remote PE for synchronization.
-                - Provides low-overhead notification mechanism between PEs.
-                - The signal variable must be of type uint64_t in symmetric memory.
-
-            Example:
-                ```python
-                # Atomically set remote signal to 1 to notify completion
-                NVSHMEM_SIGNAL_SET = 0
-                nvshmem.signal_op(remote_signal_ptr, 1, NVSHMEM_SIGNAL_SET, target_pe)
-                ```
-            """
-            return core.extern_elementwise(
-                "",
-                "",
-                [sig_addr, signal, sig_op, pe],
-                {
-                    (
-                        core.dtype("int64"),
-                        core.dtype("int64"),
-                        core.dtype("int32"),
-                        core.dtype("int32"),
-                    ): ("nvshmemx_signal_op", core.dtype("int32"))
-                },
-                is_pure=False,
-                _semantic=_semantic,
-            )
-
-    else:
-
-        @triton.jit  # type: ignore[misc]
-        def signal_op(sig_addr, signal, sig_op, pe):  # type: ignore[no-untyped-def]
-            """rocSHMEM: nvshmemx_signal_op has no device-bitcode equivalent.
-
-            Use rocshmem_uint64_atomic_set / rocshmem_uint64_atomic_add on the
-            host side, or restructure the kernel to avoid runtime-dispatched
-            signal operations.
-            """
-            tl.static_assert(
-                False,
-                "nvshmemx_signal_op has no rocSHMEM device-bitcode equivalent. "
-                "Use rocshmem_uint64_atomic_set or rocshmem_uint64_atomic_add instead.",
-            )
+        Example:
+            ```python
+            # Atomically set remote signal to 1 to notify completion
+            NVSHMEM_SIGNAL_SET = 0
+            nvshmem.signal_op(remote_signal_ptr, 1, NVSHMEM_SIGNAL_SET, target_pe)
+            ```
+        """
+        return core.extern_elementwise(
+            "",
+            "",
+            [sig_addr, signal, sig_op, pe],
+            {
+                (
+                    core.dtype("int64"),
+                    core.dtype("int64"),
+                    core.dtype("int32"),
+                    core.dtype("int32"),
+                ): ("nvshmemx_signal_op", core.dtype("int32"))
+            },
+            is_pure=False,
+            _semantic=_semantic,
+        )
 
     # Memory Ordering Operations
     @core.extern
@@ -939,7 +712,7 @@ if has_triton():
             "",
             [],
             {
-                (): (_hip_device_api("nvshmem_fence"), core.dtype("int32")),
+                (): ("nvshmem_fence", core.dtype("int32")),
             },
             is_pure=False,
             _semantic=_semantic,
@@ -987,7 +760,7 @@ if has_triton():
             "",
             [],
             {
-                (): (_hip_device_api("nvshmem_quiet"), core.dtype("int32")),
+                (): ("nvshmem_quiet", core.dtype("int32")),
             },
             is_pure=False,
             _semantic=_semantic,
@@ -1032,7 +805,7 @@ if has_triton():
             "",
             "",
             [],
-            {(): (_hip_device_api("nvshmem_my_pe"), core.dtype("int32"))},
+            {(): ("nvshmem_my_pe", core.dtype("int32"))},
             is_pure=True,
             _semantic=_semantic,
         )
@@ -1075,7 +848,7 @@ if has_triton():
             "",
             "",
             [],
-            {(): (_hip_device_api("nvshmem_n_pes"), core.dtype("int32"))},
+            {(): ("nvshmem_n_pes", core.dtype("int32"))},
             is_pure=True,
             _semantic=_semantic,
         )
@@ -1122,7 +895,7 @@ if has_triton():
             "",
             "",
             [],
-            {(): (_hip_device_api("nvshmem_barrier_all"), core.dtype("int32"))},
+            {(): ("nvshmem_barrier_all", core.dtype("int32"))},
             is_pure=False,
             _semantic=_semantic,
         )
@@ -1168,7 +941,7 @@ if has_triton():
             "",
             "",
             [],
-            {(): (_hip_device_api("nvshmem_sync_all"), core.dtype("int32"))},
+            {(): ("nvshmem_sync_all", core.dtype("int32"))},
             is_pure=False,
             _semantic=_semantic,
         )
@@ -1421,50 +1194,6 @@ if has_triton():
             _semantic=_semantic,
         )
 
-    # -----------------------------------------------------------------------
-    # rocSHMEM collective stubs (USE_ROCM)
-    #
-    # alltoall, broadcast, and reduce have no wg-scoped device-callable
-    # variants in the rocSHMEM device bitcode (rocshmem_wrapper.cc only
-    # exposes host-launch kernel globals).  Override the NVSHMEM definitions
-    # above with static_assert stubs so that any attempt to use them on ROCm
-    # produces a clear compile-time error.
-    #
-    # All other device symbol name differences (putmem/getmem block→wg,
-    # nvshmem_*→rocshmem_*, etc.) are handled transparently by _hip_device_api()
-    # which looks up NVSHMEM_TO_ROCSHMEM_DEVICE_MAPPINGS from cuda_to_hip_mappings.
-    # -----------------------------------------------------------------------
-
-    if torch.version.hip is not None:
-
-        @triton.jit  # type: ignore[misc]
-        def alltoall(team, dest, source, nelems_per_pe):  # type: ignore[no-untyped-def]
-            """rocSHMEM: alltoall not available as a device-callable wg op."""
-            tl.static_assert(
-                False,
-                "rocshmem_alltoallmem_wg is not available in the device bitcode. "
-                "Use host-side rocshmem_alltoallmem_on_stream instead.",
-            )
-
-        @triton.jit  # type: ignore[misc]
-        def broadcast(team, dest, source, nelems, pe_root):  # type: ignore[no-untyped-def]
-            """rocSHMEM: broadcast not available as a device-callable wg op."""
-            tl.static_assert(
-                False,
-                "rocshmem_broadcastmem_wg is not available in the device bitcode. "
-                "Use host-side rocshmem_broadcastmem_on_stream instead.",
-            )
-
-        @triton.jit  # type: ignore[misc]
-        def reduce(team, dest, source, nreduce, operation: tl.constexpr):  # type: ignore[no-untyped-def]
-            """rocSHMEM: team reduce not available as a device-callable wg op."""
-            tl.static_assert(
-                False,
-                "rocshmem team reduce is not available in the device bitcode. "
-                "Use host-side rocshmem reduce API instead.",
-            )
-
-    # -----------------------------------------------------------------------
     # Utility for inspecting Triton kernels
 
     triton_kernels: dict = {}

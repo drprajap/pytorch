@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <dlfcn.h>
+#include <vector>
 #include <ATen/ceil_div.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -9,7 +11,6 @@
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryUtils.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/SymmetricMemory.hpp>
 
-#include <ATen/ceil_div.h>
 // Use torch's cub wrapper instead of CUDA's <cub/cub.cuh>, see #55292
 #include <ATen/cuda/cub.cuh>
 
@@ -42,12 +43,12 @@ extern "C" void nvshmem_init() __attribute__((weak));
 
 // Check if NVSHMEM is available
 bool is_nvshmem_available() {
-  // Runtime check
+  // Runtime check: try to dlopen the NVSHMEM host library.
   static std::mutex mutex;
   static int is_available = -2;
   std::lock_guard<std::mutex> lock(mutex);
 
-  // Checked if the symbol is statically linked
+  // Check if the symbol is statically linked
   if(is_available == -2 && nvshmem_init) {
     is_available = 1;
   }
@@ -68,20 +69,14 @@ bool is_nvshmem_available() {
   return is_available == 1;
 }
 
-// Initializes the device state in CUmodule/hipModule_t so that it’s able to
-// perform NVSHMEM/rocSHMEM operations (populates ROCSHMEM_CTX_DEFAULT global).
+
+// Initializes the device state in CUmodule so that it's able to perform NVSHMEM
+// operations.
 void nvshmemx_cumodule_init(uintptr_t module) {
-#if defined(USE_ROCM)
-  auto hipmodule = reinterpret_cast<hipModule_t>(module);
-  NVSHMEM_CHECK(
-    ::rocshmem_hipmodule_init(hipmodule),
-    "rocshmem_hipmodule_init failed");
-#else
   auto cumodule = reinterpret_cast<CUmodule>(module);
   NVSHMEM_CHECK(
     ::nvshmemx_cumodule_init(cumodule),
     "nvshmemx_cumodule_init failed");
-#endif
 }
 
 at::Tensor nvshmem_broadcast(at::Tensor& input, const int64_t root, const std::string& group_name) {
@@ -184,7 +179,8 @@ __device__ int64_t prefixSum(int64_t *odata, int64_t *idata, int n) {
   // - `BLOCK_SCAN_WARP_SCANS` is a low-latency scan algorithm (instead of high
   // throughput which we don't need here).
   // - `at_cuda_detail::cub` is torch's cub wrapper, see #55292.
-  using BlockScanT = at_cuda_detail::cub::BlockScan<int64_t, THREADS_PER_BLOCK, at_cuda_detail::cub::BLOCK_SCAN_WARP_SCANS>;
+  using BlockScanT = ROCM_HIPCUB(at_cuda_detail::cub)::BlockScan<int64_t,
+        THREADS_PER_BLOCK, ROCM_HIPCUB(at_cuda_detail::cub)::BLOCK_SCAN_WARP_SCANS>;
   // Allocate shared memory for BlockScan
   __shared__ typename BlockScanT::TempStorage temp_storage;
 
@@ -204,6 +200,22 @@ __device__ int64_t prefixSum(int64_t *odata, int64_t *idata, int n) {
   odata[tid] = thread_data;
   return block_aggregate;
 }
+
+static int get_a2a_nblocks(size_t size, int world_size, bool intra_node) {
+  // Check user setting first
+  int num_blocks = c10d::symmetric_memory::getenv_nblocks();
+  if (num_blocks > 0) {  // set by user
+    return num_blocks;
+  }
+  // 16B per thread, 8 loops
+  constexpr size_t chunk_size = 16 * THREADS_PER_BLOCK * 8;
+  num_blocks = at::ceil_div(size, chunk_size);
+  // Allow kernel to target even number of blocks per peer
+  num_blocks = at::round_up(num_blocks, world_size);
+  const int max_blocks = intra_node ? 64 : 16;
+  return ::min(num_blocks, max_blocks);
+}
+
 
 // This kernel is used to exchange output splits and source offsets between peers.
 // `in_out_splits` is of size (3, npes) and contains:
@@ -282,28 +294,13 @@ __global__ void allToAllV(void *send_data, void *recv_data, int64_t* out_splits_
       block_size,
       peer_global);
   }
-  // Write out the output offsets (to the scratchpad line)
+  // Write out the output offsets (to the scratchpad line).
   if (bid == 0 && tid < npes) {
     source_offsets[tid] = peer_offsets[tid];
   }
   // Make sure getmem_nbi calls finish
   nvshmem_quiet();
 #endif
-}
-
-static int get_a2a_nblocks(size_t size, int world_size, bool intra_node) {
-  // Check user setting first
-  int num_blocks = c10d::symmetric_memory::getenv_nblocks();
-  if (num_blocks > 0) {  // set by user
-    return num_blocks;
-  }
-  // 16B per thread, 8 loops
-  constexpr size_t chunk_size = 16 * THREADS_PER_BLOCK * 8;
-  num_blocks = at::ceil_div(size, chunk_size);
-  // Allow kernel to target even number of blocks per peer
-  num_blocks = at::round_up(num_blocks, world_size);
-  const int max_blocks = intra_node ? 64 : 16;
-  return std::min(num_blocks, max_blocks);
 }
 
 void all_to_all_vdev(
@@ -313,18 +310,21 @@ void all_to_all_vdev(
     at::Tensor& out_splits_offsets,
     std::string group_name) {
   /* Perform AllToAllv operation using NVSHMEM, with split information provided on device.
+   * Step 1: Rendezvous tensors so all ranks have symmetric (device) pointers.
+   * Step 2: Launch exchangeSplitAndOffset kernel to exchange per-rank split counts
+   *         and compute source offsets (prefix sum); uses team barrier.
+   * Step 3: Launch allToAllV kernel to copy data between peers according to
+   *         the exchanged splits/offsets.
    * Arguments:
-   *  - `input` is the input tensor
-   *  - `out` is the output tensor
-   *  - `in_splits` is a 1D tensor of size (npes), containing the input splits
-   *  - `out_splits_offsets` is a 2D tensor of size (2, npes). The rows are (in order):
-        output splits and output offsets.
-  */
+   *  - `input` is the send bufffer
+   *  - `out` is the receive buffer
+   *  - `in_splits`: 1D[npes] num of elements this rank sends to each peer
+   *  - `out_splits_offsets`:2D (2, npes). row0 = output splits, row1 = output offsets
+   */
   auto input_hdl = c10d::symmetric_memory::rendezvous(input, group_name);
   auto out_hdl = c10d::symmetric_memory::rendezvous(out, group_name);
   auto in_splits_hdl = c10d::symmetric_memory::rendezvous(in_splits, group_name);
   auto out_splits_offsets_hdl = c10d::symmetric_memory::rendezvous(out_splits_offsets, group_name);
-  int rank = input_hdl->get_rank();
   int world_size = input_hdl->get_world_size();
 
   void* input_ptr = input.data_ptr();
@@ -352,7 +352,6 @@ void all_to_all_vdev(
       args0,
       0,
       stream);
-
   // CTA Tuning
   auto input_size = input.numel() * input.element_size();
   int num_blocks = get_a2a_nblocks(
@@ -380,6 +379,46 @@ void all_to_all_vdev(
 }
 
 // Start of `all_to_all_vdev_2d`
+
+// This is an warp-scope, exclusive prefix sum. When called by a block of
+// threads, each warp will perform an independent prefix sum, concurrently.
+// Returns the sum of all elements in the warp.
+// `NUM_WARPS` is the number of warps participating the concurrent prefix sum.
+template <int NUM_WARPS>
+__device__ int64_t prefixSum_warp(int64_t *odata, int64_t *idata, int n) {
+  CUDA_KERNEL_ASSERT(n <= WARP_SIZE);
+
+  // Specialize WarpScan for type int
+  using WarpScan = ROCM_HIPCUB(at_cuda_detail::cub)::WarpScan<int64_t>;
+  // Allocate WarpScan shared memory for N warps
+  __shared__ typename WarpScan::TempStorage temp_storage[NUM_WARPS];
+
+  int warp_id = threadIdx.x / WARP_SIZE;
+  if (warp_id >= NUM_WARPS) {
+    return 0;
+  }
+
+  // Obtain input item for each thread
+  int tid = threadIdx.x % WARP_SIZE;
+  int64_t thread_data = (tid < n) ? idata[tid] : 0;
+
+  // Total sum of all elements in the warp
+  int64_t warp_aggregate;
+  // Compute the warp-wide exclusive prefix sum
+  WarpScan(temp_storage[warp_id]).ExclusiveSum(thread_data, thread_data, warp_aggregate);
+
+  // Store only valid lanes to avoid out-of-bounds writes when n < WARP_SIZE.
+  if (tid < n) {
+    odata[tid] = thread_data;
+  }
+  return warp_aggregate;
+}
+
+// This is for abstracting a thread-group-scope, exclusive prefix sum.
+// Since we use warp-scope prefix sum, the thread group size is limited to warp size.
+#define A2AV_TILE_SIZE WARP_SIZE
+
+
 
 // `exchangeSplitAndOffset_2d` is used to exchange output splits and source
 // offsets between peers.
@@ -453,41 +492,6 @@ __global__ void exchangeSplitAndOffset_2d(int64_t* in_splits_offsets, int64_t* o
 #endif
 }
 
-// This is an warp-scope, exclusive prefix sum. When called by a block of
-// threads, each warp will perform an independent prefix sum, concurrently.
-// Returns the sum of all elements in the warp.
-// `NUM_WARPS` is the number of warps participating the concurrent prefix sum.
-template <int NUM_WARPS>
-__device__ int64_t prefixSum_warp(int64_t *odata, int64_t *idata, int n) {
-  CUDA_KERNEL_ASSERT(n <= WARP_SIZE);
-
-  // Specialize WarpScan for type int
-  using WarpScan = at_cuda_detail::cub::WarpScan<int64_t>;
-  // Allocate WarpScan shared memory for N warps
-  __shared__ typename WarpScan::TempStorage temp_storage[NUM_WARPS];
-
-  int warp_id = threadIdx.x / WARP_SIZE;
-  if (warp_id >= NUM_WARPS) {
-    return 0;
-  }
-
-  // Obtain input item for each thread
-  int tid = threadIdx.x % WARP_SIZE;
-  int64_t thread_data = (tid < n) ? idata[tid] : 0;
-
-  // Total sum of all elements in the warp
-  int64_t warp_aggregate;
-  // Compute the warp-wide exclusive prefix sum
-  WarpScan(temp_storage[warp_id]).ExclusiveSum(thread_data, thread_data, warp_aggregate);
-
-  // Store the result
-  odata[tid] = thread_data;
-  return warp_aggregate;
-}
-
-// This is for abstracting a thread-group-scope, exclusive prefix sum.
-// Since we use warp-scope prefix sum, the thread group size is limited to warp size.
-#define A2AV_TILE_SIZE WARP_SIZE
 
 // This kernel is used to do the actual data exchange.
 // `in_out_splits` has the same definition as in `exchangeSplitAndOffset`.
@@ -578,7 +582,6 @@ __global__ void allToAllV_2d(void *send_data, void *recv_data, int64_t* in_split
       peer_size,
       peer_global);  // peer's global index
   }
-  // Write out the output offsets (to the scratchpad line)
   if (bid == 0 && tid < nsplits) {
     source_offsets[tid] = tile_prefix_sums[tid / minor_size][tid % minor_size];
   }
@@ -634,7 +637,6 @@ void all_to_all_vdev_2d(
   auto out_hdl = c10d::symmetric_memory::rendezvous(out, group_name);
   auto in_splits_hdl = c10d::symmetric_memory::rendezvous(in_splits, group_name);
   auto out_splits_offsets_hdl = c10d::symmetric_memory::rendezvous(out_splits_offsets, group_name);
-  int rank = input_hdl->get_rank();
   int world_size = input_hdl->get_world_size();
   // TODO: world_size is currently limited by the number of elements in a WarpScan.
   TORCH_CHECK(world_size <= A2AV_TILE_SIZE, "world_size must be smaller than A2AV_TILE_SIZE", A2AV_TILE_SIZE);
@@ -691,7 +693,6 @@ void all_to_all_vdev_2d(
   // Exchange output splits and source offsets
   auto input_dim0 = input.size(0);
   bool rank_is_row_in = true;
-  // Use collective launch because kernel involves nvshmem barrier
   void* args0[] = {
       &in_splits_ptr,
       &out_splits_offsets_ptr,
@@ -706,7 +707,6 @@ void all_to_all_vdev_2d(
       args0,
       0,
       stream);
-
   // CTA Tuning
   // Naive for now, use 1 block per expert.
   // Total number of blocks is limited to 64 (intra-node) or 8 (inter-node).
@@ -826,7 +826,6 @@ void all_to_all_vdev_2d_offset(
   // Exchange output splits and source offsets
   auto input_dim0 = input.size(0);
   bool rank_is_row_in = false;
-  // Use collective launch because kernel involves nvshmem barrier
   void* args0[] = {
       &in_splits_offsets_ptr,
       &out_splits_offsets_ptr,
@@ -841,7 +840,6 @@ void all_to_all_vdev_2d_offset(
       args0,
       0,
       stream);
-
   // CTA Tuning
   // Naive for now, use 1 block per expert.
   // Total number of blocks is limited to 64 (intra-node) or 8 (inter-node).
@@ -873,7 +871,6 @@ void all_to_all_vdev_2d_offset(
 }
 
 /* Tiled Communication */
-
 using Shape2D = nvshmemx::shape<int64_t, int64_t>;
 using Stride2D = nvshmemx::stride<int64_t, int64_t>;
 
@@ -1043,7 +1040,7 @@ void multi_root_tile_reduce(
   int nblocks = at::ceil_div(
       out_tile.numel() * out_tile.element_size(),
       (int64_t)THREADS_PER_BLOCK * 16);
-  nblocks = std::min(nblocks, 24);
+  nblocks = ::min(nblocks, 24);
 
   // Need one team per block
   auto& team_manager = TeamManager::get(device);
@@ -1075,7 +1072,6 @@ void multi_root_tile_reduce(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   });
 }
-
 } // namespace c10d::nvshmem_extension
 
 

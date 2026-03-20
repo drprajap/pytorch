@@ -1,4 +1,10 @@
-#include <hip/hip_runtime.h>
+// rocSHMEM implementation of c10d::nvshmem_extension (see nvshmem_extension.hpp).
+// Algorithm and comments follow nvshmem_extension.cu / PyTorch PR #173518; ROCm uses
+// plain kernel launches, hipStreamSynchronize + rocshmem_barrier_all where NVSHMEM
+// uses collective launch, and separate writeOutputOffsets* kernels (no grid-wide sync).
+// This TU links into torch_rocshmem only. The trailing c10d::rocshmem_extension
+// symbols support Triton (_rocshmem_hipmodule_init); not present in the PR file alone.
+
 #include <algorithm>
 #include <vector>
 #include <ATen/ceil_div.h>
@@ -6,6 +12,7 @@
 
 #include <torch/csrc/distributed/c10d/symm_mem/env.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nvshmem_extension.hpp>
+#include <torch/csrc/distributed/c10d/symm_mem/rocshmem_extension.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nvshmem_team_manager.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemory-inl.cuh>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemoryUtils.hpp>
@@ -13,28 +20,39 @@
 
 #include <ATen/hip/cub.cuh>
 
-#include <c10/hip/HIPException.h>
 #include <rocshmem/rocshmem.hpp>
 
 using namespace rocshmem;
+
 namespace c10d::nvshmem_extension {
 
 #define THREADS_PER_BLOCK 512
 #define WARP_SIZE 64
 
-extern "C" void rocshmem_init() __attribute__((weak));
+// ---------------------------------------------------------------------------
+// Host-side availability + module-init
+// ---------------------------------------------------------------------------
+
 bool is_nvshmem_available() {
+  // rocSHMEM is compiled in by default; no runtime dlopen needed.
   return true;
 }
 
 void nvshmemx_cumodule_init(uintptr_t module) {
   auto hipmodule = reinterpret_cast<hipModule_t>(module);
   NVSHMEM_CHECK(
-    rocshmem_hipmodule_init(hipmodule),
+    ::rocshmem_hipmodule_init(hipmodule, nullptr),
     "rocshmem_hipmodule_init failed");
 }
 
-at::Tensor nvshmem_broadcast(at::Tensor& input, const int64_t root, const std::string& group_name) {
+// ---------------------------------------------------------------------------
+// Host-side collective wrappers
+// ---------------------------------------------------------------------------
+
+at::Tensor nvshmem_broadcast(
+    at::Tensor& input,
+    const int64_t root,
+    const std::string& group_name) {
   auto input_hdl = c10d::symmetric_memory::rendezvous(input, group_name);
   int rank = input_hdl->get_rank();
   void* buffer_ptr = input.mutable_data_ptr();
@@ -68,10 +86,18 @@ void nvshmem_put(at::Tensor& tensor, const int64_t peer) {
 void nvshmem_wait_for_signal(at::Tensor& sigpad, int64_t signal, int64_t peer) {
   c10::cuda::CUDAGuard guard(sigpad.device());
   auto stream = at::cuda::getCurrentCUDAStream();
-  rocshmem_signal_wait_until_on_stream(static_cast<uint64_t*>(sigpad.data_ptr()), ROCSHMEM_CMP_EQ, signal, stream);
+  rocshmem_signal_wait_until_on_stream(
+      static_cast<uint64_t*>(sigpad.data_ptr()),
+      ROCSHMEM_CMP_EQ,
+      signal,
+      stream);
 }
 
-void nvshmem_put_with_signal(at::Tensor& tensor, at::Tensor& sigpad, int64_t signal, int64_t peer) {
+void nvshmem_put_with_signal(
+    at::Tensor& tensor,
+    at::Tensor& sigpad,
+    int64_t signal,
+    int64_t peer) {
   auto buffer_size = tensor.numel() * tensor.element_size();
 
   c10::cuda::CUDAGuard guard(tensor.device());
@@ -128,8 +154,9 @@ at::Tensor nvshmem_all_to_all(
   return out;
 }
 
-// This is an exclusive prefix sum function that calculates read (or write) offsets for each peer.
-__device__ int64_t prefixSum(int64_t *odata, int64_t *idata, int n) {
+// This is an exclusive prefix sum function that calculates read (or write)
+// offsets for each peer.
+__device__ int64_t prefixSum(int64_t* odata, int64_t* idata, int n) {
   // Specialize BlockScan for a 1D block of threads, of type int64_t.
   // - `BLOCK_SCAN_WARP_SCANS` is a low-latency scan algorithm (instead of high
   // throughput which we don't need here).
@@ -171,14 +198,15 @@ static int get_a2a_nblocks(size_t size, int world_size, bool intra_node) {
   return ::min(num_blocks, max_blocks);
 }
 
-// ROCm-only offset writeback kernel.
-//
-// On ROCm, allToAllV is a regular multi-block kernel with no grid-wide barrier.
-// Writing source_offsets in-kernel can race with other blocks still reading it for
-// remote gets. We therefore compute output offsets in a separate kernel after
-// allToAllV has completed on the stream.
+// ---------------------------------------------------------------------------
+// ROCm-only output-offset writeback kernel (1-D all-to-all).
+// On ROCm, allToAllV is a regular multi-block kernel with no grid-wide
+// barrier, so writing output offsets in-kernel can race with blocks still
+// reading source_offsets. They are written in this separate kernel after
+// allToAllV completes on the stream.
+// ---------------------------------------------------------------------------
 __global__ void writeOutputOffsets1d(int64_t* out_splits_offsets, int world_size) {
-  auto output_splits = out_splits_offsets;
+  auto output_splits  = out_splits_offsets;
   auto output_offsets = out_splits_offsets + world_size;
   int tid = threadIdx.x;
 
@@ -191,16 +219,20 @@ __global__ void writeOutputOffsets1d(int64_t* out_splits_offsets, int world_size
     output_offsets[tid] = peer_offsets[tid];
   }
 }
+
 // This kernel is used to exchange output splits and source offsets between peers.
 // `in_out_splits` is of size (3, npes) and contains:
 // - input splits (IN)
 // - output splits (OUT) and
 // - source offsets (OUT).
-__global__ void exchangeSplitAndOffset(int64_t* input_splits, int64_t* out_splits_offsets, rocshmem_team_t team) {
+__global__ void exchangeSplitAndOffset(
+    int64_t* input_splits,
+    int64_t* out_splits_offsets,
+    rocshmem_team_t team) {
   CUDA_KERNEL_ASSERT(team != ROCSHMEM_TEAM_INVALID);
   int mype = rocshmem_team_my_pe(team);
   int npes = rocshmem_team_n_pes(team);
-  auto output_splits = out_splits_offsets;
+  auto output_splits  = out_splits_offsets;
   auto source_offsets = out_splits_offsets + npes;
   int tid = threadIdx.x;
 
@@ -209,26 +241,32 @@ __global__ void exchangeSplitAndOffset(int64_t* input_splits, int64_t* out_split
 
   // Scan input splits to get the source offsets
   prefixSum(peer_offsets, input_splits, npes);
-  __syncthreads();;
+  __syncthreads();
 
   // Use 1 block to do the exchange
   if (tid < npes) {
     // tid is peer index within team, but put calls require global rank
     int peer_global = rocshmem_team_translate_pe(team, tid, ROCSHMEM_TEAM_WORLD);
     rocshmem_int64_p(source_offsets + mype, peer_offsets[tid], peer_global);
-    rocshmem_int64_p(output_splits + mype, input_splits[tid], peer_global);
+    rocshmem_int64_p(output_splits  + mype, input_splits[tid], peer_global);
   }
+  // This barrier ensures that all remote PEs see the updated values
   rocshmem_barrier_wg();
 }
 
 // This kernel is used to do the actual data exchange.
 // `in_out_splits` has the same definition as in `exchangeSplitAndOffset`.
 // `stride` is the stride at dim 0, unit in byte.
-__global__ void allToAllV(void *send_data, void *recv_data, int64_t* out_splits_offsets, size_t stride, rocshmem_team_t team) {
+__global__ void allToAllV(
+    void* send_data,
+    void* recv_data,
+    int64_t* out_splits_offsets,
+    size_t stride,
+    rocshmem_team_t team) {
   CUDA_KERNEL_ASSERT(team != ROCSHMEM_TEAM_INVALID);
   int mype = rocshmem_team_my_pe(team);
   int npes = rocshmem_team_n_pes(team);
-  auto output_splits = out_splits_offsets;
+  auto output_splits  = out_splits_offsets;
   auto source_offsets = out_splits_offsets + npes;
   int bid = blockIdx.x;
   int tid = threadIdx.x;
@@ -243,23 +281,24 @@ __global__ void allToAllV(void *send_data, void *recv_data, int64_t* out_splits_
   // Target a different peer based on bid
   for (int i = bid / blocks_per_peer; i < npes; i += gridDim.x / blocks_per_peer) {
     int peer = (mype + i) % npes;
-    auto peer_global = rocshmem_team_translate_pe(team, peer, ROCSHMEM_TEAM_WORLD);
+    auto peer_global  = rocshmem_team_translate_pe(team, peer, ROCSHMEM_TEAM_WORLD);
     // Total amount from `peer`
-    auto peer_size = output_splits[peer] * stride;
+    auto peer_size    = output_splits[peer] * stride;
     // Amount to get from `peer` in this block
-    auto block_size = peer_size / blocks_per_peer;
+    auto block_size   = peer_size / blocks_per_peer;
     // Being lazy here, we should handle the residual if the division is not exact
     CUDA_KERNEL_ASSERT(block_size * blocks_per_peer == peer_size);
     // This block's offset in the data from `peer`
-    auto block_offset = block_size * (bid % blocks_per_peer);
+    auto block_offset  = block_size * (bid % blocks_per_peer);
     auto source_offset = source_offsets[peer] * stride + block_offset;
-    auto write_offset = peer_offsets[peer] * stride + block_offset;
+    auto write_offset  = peer_offsets[peer]   * stride + block_offset;
     rocshmem_getmem_nbi_wg(
       (char*)recv_data + write_offset,
       (char*)send_data + source_offset,
       block_size,
       peer_global);
   }
+  // Make sure getmem_nbi calls finish
   rocshmem_quiet();
 }
 
@@ -269,7 +308,7 @@ void all_to_all_vdev(
     at::Tensor& in_splits,
     at::Tensor& out_splits_offsets,
     std::string group_name) {
-  /* Perform AllToAllv operation using NVSHMEM, with split information provided on device.
+  /* Perform AllToAllv operation using rocSHMEM, with split information provided on device.
    * Step 1: Rendezvous tensors so all ranks have symmetric (device) pointers.
    * Step 2: Launch exchangeSplitAndOffset kernel to exchange per-rank split counts
    *         and compute source offsets (prefix sum); uses team barrier.
@@ -279,7 +318,7 @@ void all_to_all_vdev(
    *  - `input` is the send buffer
    *  - `out` is the receive buffer
    *  - `in_splits`: 1D[npes] num of elements this rank sends to each peer
-   *  - `out_splits_offsets`:2D (2, npes). row0 = output splits, row1 = output offsets
+   *  - `out_splits_offsets`: 2D (2, npes). row0 = output splits, row1 = output offsets
    */
   auto input_hdl = c10d::symmetric_memory::rendezvous(input, group_name);
   auto out_hdl = c10d::symmetric_memory::rendezvous(out, group_name);
@@ -287,23 +326,25 @@ void all_to_all_vdev(
   auto out_splits_offsets_hdl = c10d::symmetric_memory::rendezvous(out_splits_offsets, group_name);
   int world_size = input_hdl->get_world_size();
 
-  void* input_ptr = input.data_ptr();
-  void* output_ptr = out.mutable_data_ptr();
-  int64_t* in_splits_ptr = (int64_t*)(in_splits.const_data_ptr());
+  void*    input_ptr             = input.data_ptr();
+  void*    output_ptr            = out.mutable_data_ptr();
+  int64_t* in_splits_ptr         = (int64_t*)(in_splits.const_data_ptr());
   int64_t* out_splits_offsets_ptr = (int64_t*)(out_splits_offsets.mutable_data_ptr());
 
   TORCH_CHECK_EQ(input.device(), out.device());
   auto device = input.device();
   c10::cuda::CUDAGuard guard(device);
   auto& team_manager = TeamManager::get(device);
-  auto team = team_manager.get_team(group_name, input_hdl->get_rank_to_global_rank());
+  auto team   = team_manager.get_team(group_name, input_hdl->get_rank_to_global_rank());
   auto stream = at::cuda::getCurrentCUDAStream(device.index());
 
+  // Exchange output splits and source offsets (regular launch + stream sync + host barrier)
   exchangeSplitAndOffset<<<dim3(1), dim3(THREADS_PER_BLOCK), 0, stream>>>(
       in_splits_ptr, out_splits_offsets_ptr, team);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   C10_CUDA_CHECK(hipStreamSynchronize(stream));
   rocshmem::rocshmem_barrier_all();
+
   // CTA Tuning
   auto input_size = input.numel() * input.element_size();
   int num_blocks = get_a2a_nblocks(
@@ -314,9 +355,9 @@ void all_to_all_vdev(
   // Stride at dim 0 (assuming input is contiguous, TODO)
   size_t stride_bytes = input.stride(0) * input.element_size();
 
+  // All to all data exchange
   allToAllV<<<dim3(num_blocks), dim3(THREADS_PER_BLOCK), 0, stream>>>(
-      input_ptr, output_ptr, out_splits_offsets_ptr,
-      stride_bytes, team);
+      input_ptr, output_ptr, out_splits_offsets_ptr, stride_bytes, team);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   C10_CUDA_CHECK(hipStreamSynchronize(stream));
   // `allToAllV` reads source_offsets while fetching remote shards. Since ROCm has
@@ -329,12 +370,12 @@ void all_to_all_vdev(
 
 // Start of `all_to_all_vdev_2d`
 
-// This is an warp-scope, exclusive prefix sum. When called by a block of
+// This is a warp-scope, exclusive prefix sum. When called by a block of
 // threads, each warp will perform an independent prefix sum, concurrently.
 // Returns the sum of all elements in the warp.
 // `NUM_WARPS` is the number of warps participating the concurrent prefix sum.
 template <int NUM_WARPS>
-__device__ int64_t prefixSum_warp(int64_t *odata, int64_t *idata, int n) {
+__device__ int64_t prefixSum_warp(int64_t* odata, int64_t* idata, int n) {
   CUDA_KERNEL_ASSERT(n <= WARP_SIZE);
 
   // Specialize WarpScan for type int
@@ -367,29 +408,43 @@ __device__ int64_t prefixSum_warp(int64_t *odata, int64_t *idata, int n) {
 // Since we use warp-scope prefix sum, the thread group size is limited to warp size.
 #define A2AV_TILE_SIZE WARP_SIZE
 
-
+// ROCm-only: same tile prefix-sum layout as allToAllV_2d, but writes source_offsets
+// after the data kernel (no grid-wide sync on ROCm).
 __global__ void writeOutputOffsets_2d(
     int64_t* out_splits_offsets,
     int minor_size,
     int major_size,
     int64_t major_align) {
-  int nsplits = minor_size * major_size;
-  auto output_splits = out_splits_offsets;
+  int nsplits       = minor_size * major_size;
+  auto output_splits  = out_splits_offsets;
   auto source_offsets = out_splits_offsets + nsplits;
   int tid = threadIdx.x;
 
+  // Split the thread block into tiles
   constexpr int NUM_TILES = THREADS_PER_BLOCK / A2AV_TILE_SIZE;
   int tileId = tid / A2AV_TILE_SIZE;
   int laneId = tid % A2AV_TILE_SIZE;
   __shared__ int64_t tile_prefix_sums[NUM_TILES][A2AV_TILE_SIZE];
   int nsplits_per_tile = min(minor_size, nsplits - tileId * minor_size);
 
+  // TODO: currently it is assumed that the number of PE's is smaller than
+  // `A2AV_TILE_SIZE` bc the warp-scope prefix sum can only handle up to
+  // WARP_SIZE elements
+  CUDA_KERNEL_ASSERT(minor_size <= A2AV_TILE_SIZE && "minor_size is too large\n");
+  CUDA_KERNEL_ASSERT(major_size <= NUM_TILES && "major_size is too large\n");
+
   __shared__ int64_t len_per_tile[NUM_TILES];
   if (nsplits_per_tile > 0) {
-    int64_t my_tile_len = prefixSum_warp<NUM_TILES>(tile_prefix_sums[tileId], output_splits + tileId * minor_size, nsplits_per_tile);
+    int64_t my_tile_len = prefixSum_warp<NUM_TILES>(
+        tile_prefix_sums[tileId],
+        output_splits + tileId * minor_size,
+        nsplits_per_tile);
     if (laneId == A2AV_TILE_SIZE - 1) {
       if (major_align != 0) {
         auto aligned_len = (my_tile_len + major_align - 1) / major_align * major_align;
+        // In case `aligned_len` is 0, we set it to `major_align` to avoid an
+        // empty bin, bc cutlass currently does not support it. See
+        // https://github.com/pytorch/pytorch/issues/152668.
         len_per_tile[tileId] = max(aligned_len, major_align);
       } else {
         len_per_tile[tileId] = my_tile_len;
@@ -398,7 +453,13 @@ __global__ void writeOutputOffsets_2d(
   }
   __syncthreads();
 
-  __shared__ int64_t start_offset_per_tile[WARP_SIZE];
+  // Starting offset of each tile
+  __shared__ int64_t start_offset_per_tile[NUM_TILES];
+  // Prefix sum again to get the tiles' start offsets.
+  // `NUM_TILES` is typically not greater than 32, because 32 tiles * 32 threads
+  // = 1024 threads, and this kernel is launched within 1024 threads. Thus, we
+  // can use warp-scope prefix sum.
+  static_assert(NUM_TILES <= WARP_SIZE);
   prefixSum_warp<1>(start_offset_per_tile, len_per_tile, NUM_TILES);
   __syncthreads();
 
@@ -428,13 +489,19 @@ __global__ void writeOutputOffsets_2d(
 */
 
 template <bool HAS_IN_OFFSETS>
-__global__ void exchangeSplitAndOffset_2d(int64_t* in_splits_offsets, int64_t* out_splits_offsets, rocshmem_team_t team, int ne, size_t input_dim0, bool rank_is_row_in) {
+__global__ void exchangeSplitAndOffset_2d(
+    int64_t* in_splits_offsets,
+    int64_t* out_splits_offsets,
+    rocshmem_team_t team,
+    int ne,
+    size_t input_dim0,
+    bool rank_is_row_in) {
   CUDA_KERNEL_ASSERT(team != ROCSHMEM_TEAM_INVALID);
-  int mype = rocshmem_team_my_pe(team);
-  int npes = rocshmem_team_n_pes(team);
+  int mype   = rocshmem_team_my_pe(team);
+  int npes   = rocshmem_team_n_pes(team);
   int nsplits = npes * ne;
-  auto input_splits = in_splits_offsets;
-  auto output_splits = out_splits_offsets;
+  auto input_splits   = in_splits_offsets;
+  auto output_splits  = out_splits_offsets;
   // Borrowing the space below as a temporary exchange pad.
   auto source_offsets = out_splits_offsets + nsplits;
   int tid = threadIdx.x;
@@ -448,8 +515,8 @@ __global__ void exchangeSplitAndOffset_2d(int64_t* in_splits_offsets, int64_t* o
     // Scan input splits to get the source offsets
     __shared__ int64_t peer_offsets[THREADS_PER_BLOCK];
     auto sum_of_splits = prefixSum(peer_offsets, input_splits, nsplits);
-    __syncthreads();;
-    CUDA_KERNEL_ASSERT(sum_of_splits <= input_dim0 && "sum of splits is larger than input dim\n");
+    __syncthreads();
+    CUDA_KERNEL_ASSERT(sum_of_splits <= (int64_t)input_dim0 && "sum of splits is larger than input dim\n");
     // Redirect the input splits to the calculated result
     input_offsets = peer_offsets;
   }
@@ -458,25 +525,25 @@ __global__ void exchangeSplitAndOffset_2d(int64_t* in_splits_offsets, int64_t* o
   if (tid < nsplits) {
     int peer, e, dst_offset;
     if (rank_is_row_in) {
-      peer = tid / ne;
-      e = tid % ne;
+      peer       = tid / ne;
+      e          = tid % ne;
       dst_offset = e * npes + mype;
     } else {  // expert is row in input
-      peer = tid % npes;
-      e = tid / npes;
+      peer       = tid % npes;
+      e          = tid / npes;
       dst_offset = mype * ne + e;
     }
     // This does a transpose from rank-major order to expert-major order
     // (or vice versa).
-    auto split_val = input_splits[tid];
+    auto split_val  = input_splits[tid];
     CUDA_KERNEL_ASSERT(split_val >= 0 && "split value is negative\n");
     auto peer_global = rocshmem_team_translate_pe(team, peer, ROCSHMEM_TEAM_WORLD);
     rocshmem_int64_p(source_offsets + dst_offset, input_offsets[tid], peer_global);
-    rocshmem_int64_p(output_splits + dst_offset, split_val, peer_global);
+    rocshmem_int64_p(output_splits  + dst_offset, split_val, peer_global);
   }
+  // This barrier ensures that all remote PEs see the updated values
   rocshmem_barrier_wg();
 }
-
 
 // This kernel is used to do the actual data exchange.
 // `in_out_splits` has the same definition as in `exchangeSplitAndOffset`.
@@ -488,9 +555,19 @@ __global__ void exchangeSplitAndOffset_2d(int64_t* in_splits_offsets, int64_t* o
 // In dispatch case, rank_is_row_out = false, major_size = ne, minor_size = npes.
 // In combine case, rank_is_row_out = true, major_size = npes, minor_size = ne.
 
-__global__ void allToAllV_2d(void *send_data, void *recv_data, int64_t* in_splits, int64_t* out_splits_offsets, size_t stride, int minor_size, int major_size, int64_t major_align, bool rank_is_row_out, rocshmem_team_t team) {
-  int nsplits = minor_size * major_size;
-  auto output_splits = out_splits_offsets;
+__global__ void allToAllV_2d(
+    void* send_data,
+    void* recv_data,
+    int64_t* in_splits,
+    int64_t* out_splits_offsets,
+    size_t stride,
+    int minor_size,
+    int major_size,
+    int64_t major_align,
+    bool rank_is_row_out,
+    rocshmem_team_t team) {
+  int nsplits         = minor_size * major_size;
+  auto output_splits  = out_splits_offsets;
   auto source_offsets = out_splits_offsets + nsplits;
   int bid = blockIdx.x;
   int tid = threadIdx.x;
@@ -499,17 +576,16 @@ __global__ void allToAllV_2d(void *send_data, void *recv_data, int64_t* in_split
   constexpr int NUM_TILES = THREADS_PER_BLOCK / A2AV_TILE_SIZE;
   int tileId = tid / A2AV_TILE_SIZE;
   int laneId = tid % A2AV_TILE_SIZE;
-  // Each tile calculates its own prefix sum
   __shared__ int64_t tile_prefix_sums[NUM_TILES][A2AV_TILE_SIZE];
-  // A tile takes care of minor_size worth of splits
   int nsplits_per_tile = min(minor_size, nsplits - tileId * minor_size);
+
   // TODO: currently it is assumed that the number of PE's is smaller than
   // `A2AV_TILE_SIZE` bc the warp-scope prefix sum can only handle up to
   // WARP_SIZE elements
   CUDA_KERNEL_ASSERT(minor_size <= A2AV_TILE_SIZE && "minor_size is too large\n");
   // Similarly, the number of experts per rank is also assumed to be smaller
   // than `NUM_TILES`
-  CUDA_KERNEL_ASSERT(major_size <= NUM_TILES && "major_size is too large\n");
+  CUDA_KERNEL_ASSERT(major_size <= NUM_TILES       && "major_size is too large\n");
 
   // Total length of each tile
   __shared__ int64_t len_per_tile[NUM_TILES];
@@ -517,7 +593,10 @@ __global__ void allToAllV_2d(void *send_data, void *recv_data, int64_t* in_split
   // this local prefix sum.
   if (nsplits_per_tile > 0) {
     // Each tile calculates its own prefix sum, return value is the sum of all elements in the tile.
-    int64_t my_tile_len = prefixSum_warp<NUM_TILES>(tile_prefix_sums[tileId], output_splits + tileId * minor_size, nsplits_per_tile);
+    int64_t my_tile_len = prefixSum_warp<NUM_TILES>(
+        tile_prefix_sums[tileId],
+        output_splits + tileId * minor_size,
+        nsplits_per_tile);
     // Last thread in each tile does the up aligning.
     if (laneId == A2AV_TILE_SIZE - 1) {
       if (major_align != 0) {  // Needs alignment
@@ -553,17 +632,19 @@ __global__ void allToAllV_2d(void *send_data, void *recv_data, int64_t* in_split
     int row = eid / minor_size;
     int col = eid % minor_size;
     // Amount from `peer` for `e`
-    auto peer_size = output_splits[eid] * stride;
+    auto peer_size    = output_splits[eid] * stride;
     auto source_offset = source_offsets[eid] * stride;
-    auto e_offset = tile_prefix_sums[row][col];
+    auto e_offset     = tile_prefix_sums[row][col];
     auto write_offset = e_offset * stride;
-    auto peer_global = rocshmem_team_translate_pe(team, rank_is_row_out ? row : col, ROCSHMEM_TEAM_WORLD);
+    auto peer_global  = rocshmem_team_translate_pe(
+        team, rank_is_row_out ? row : col, ROCSHMEM_TEAM_WORLD);
     rocshmem_getmem_nbi_wg(
       (char*)recv_data + write_offset,
       (char*)send_data + source_offset,
       peer_size,
       peer_global);  // peer's global index
   }
+  // Make sure getmem_nbi calls finish
   rocshmem_quiet();
 }
 
@@ -574,7 +655,7 @@ void all_to_all_vdev_2d(
     at::Tensor& out_splits_offsets,
     std::string group_name,
     std::optional<int64_t> major_align) {
-  /* Perform a 2D AllToAllv shuffle operation using NVSHMEM, with split information provided on device.
+  /* Perform a 2D AllToAllv shuffle operation using rocSHMEM, with split information provided on device.
    * Arguments:
    *  - `input` is the input tensor
    *  - `out` is the output tensor
@@ -616,24 +697,23 @@ void all_to_all_vdev_2d(
   auto out_splits_offsets_hdl = c10d::symmetric_memory::rendezvous(out_splits_offsets, group_name);
   int world_size = input_hdl->get_world_size();
   // TODO: world_size is currently limited by the number of elements in a WarpScan.
-  TORCH_CHECK(world_size <= A2AV_TILE_SIZE, "world_size must be smaller than A2AV_TILE_SIZE", A2AV_TILE_SIZE);
+  TORCH_CHECK(world_size <= A2AV_TILE_SIZE,
+      "world_size must be smaller than A2AV_TILE_SIZE", A2AV_TILE_SIZE);
 
   // If `major_align` is not provided, use 1 as the default value.
   int64_t major_align_val = major_align.value_or(1);
   TORCH_CHECK(major_align_val > 0, "major_align must be positive");
 
-  void* input_ptr = input.data_ptr();
-  void* output_ptr = out.mutable_data_ptr();
-  int64_t* in_splits_ptr = (int64_t*)(in_splits.data_ptr());
+  void*    input_ptr             = input.data_ptr();
+  void*    output_ptr            = out.mutable_data_ptr();
+  int64_t* in_splits_ptr         = (int64_t*)(in_splits.data_ptr());
   int64_t* out_splits_offsets_ptr = (int64_t*)(out_splits_offsets.mutable_data_ptr());
 
   // Shape checks
-  TORCH_CHECK(in_splits.is_contiguous()
-      && out_splits_offsets.is_contiguous()
-      && input.is_contiguous()
-      && out.is_contiguous(),
+  TORCH_CHECK(in_splits.is_contiguous() && out_splits_offsets.is_contiguous()
+      && input.is_contiguous() && out.is_contiguous(),
       "input, out, in_splits and out_splits_offsets must be contiguous");
-  auto in_split_shape = in_splits.sizes();
+  auto in_split_shape  = in_splits.sizes();
   auto out_split_shape = out_splits_offsets.sizes();
   TORCH_CHECK(out_split_shape.size() == 2
       && out_split_shape[0] == 2
@@ -643,8 +723,7 @@ void all_to_all_vdev_2d(
       "each row must be a multiple of world_size");
 
   // Consistency checks
-  TORCH_CHECK(input.dtype() == out.dtype()
-      && input.stride(0) == out.stride(0),
+  TORCH_CHECK(input.dtype() == out.dtype() && input.stride(0) == out.stride(0),
       "input and out must have the same dtype and same stride at dim 0");
   TORCH_CHECK(in_splits.scalar_type() == at::kLong
       && out_splits_offsets.scalar_type() == at::kLong,
@@ -657,10 +736,10 @@ void all_to_all_vdev_2d(
 
   // Set device context for getting the stream and launching kernels below
   auto device = input.device();
-  TORCH_CHECK(device.type() == at::DeviceType::CUDA &&
-      out.device() == device &&
-      in_splits.device() == device &&
-      out_splits_offsets.device() == device,
+  TORCH_CHECK(device.type() == at::DeviceType::CUDA
+      && out.device() == device
+      && in_splits.device() == device
+      && out_splits_offsets.device() == device,
       "all tensor arguments must be on the same CUDA device");
   c10::cuda::CUDAGuard guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -668,31 +747,33 @@ void all_to_all_vdev_2d(
   auto team = team_manager.get_team(group_name, input_hdl->get_rank_to_global_rank());
 
   // Exchange output splits and source offsets
-  auto input_dim0 = input.size(0);
+  auto input_dim0    = input.size(0);
   bool rank_is_row_in = true;
+
   exchangeSplitAndOffset_2d<false><<<dim3(1), dim3(THREADS_PER_BLOCK), 0, stream>>>(
       in_splits_ptr, out_splits_offsets_ptr, team,
       ne, input_dim0, rank_is_row_in);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   C10_CUDA_CHECK(hipStreamSynchronize(stream));
   rocshmem::rocshmem_barrier_all();
+
   // CTA Tuning
   // Naive for now, use 1 block per expert.
   // Total number of blocks is limited to 64 (intra-node) or 8 (inter-node).
-  int num_blocks = ::min(world_size * ne, world_size > 8 ? 8 : 64);
+  int num_blocks = std::min(world_size * ne, world_size > 8 ? 8 : 64);
 
   // Stride at dim 0
   size_t stride_bytes = input.stride(0) * input.element_size();
   bool rank_is_row_out = !rank_is_row_in;
 
+  // All to all data exchange
   allToAllV_2d<<<dim3(num_blocks), dim3(THREADS_PER_BLOCK), 0, stream>>>(
       input_ptr, output_ptr,
       in_splits_ptr, out_splits_offsets_ptr,
-      stride_bytes, world_size,
-      ne, major_align_val, rank_is_row_out, team);
+      stride_bytes, world_size, ne, major_align_val, rank_is_row_out, team);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // allToAllV_2d uses a regular multi-block launch with no grid-wide sync, so
-  // in-kernel writeback can race with other blocks still reading source_offsets.
+  C10_CUDA_CHECK(hipStreamSynchronize(stream));
+  // Same ROCm rationale as 1-D: finalize source_offsets after allToAllV_2d completes.
   writeOutputOffsets_2d<<<dim3(1), dim3(THREADS_PER_BLOCK), 0, stream>>>(
       out_splits_offsets_ptr, world_size, ne, major_align_val);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -733,7 +814,7 @@ void all_to_all_vdev_2d_offset(
   auto input_hdl = c10d::symmetric_memory::rendezvous(input, group_name);
   auto out_hdl = c10d::symmetric_memory::rendezvous(out, group_name);
   auto out_splits_offsets_hdl = c10d::symmetric_memory::rendezvous(out_splits_offsets, group_name);
-  auto in_splits_offsets_hdl = c10d::symmetric_memory::rendezvous(in_splits_offsets, group_name);
+  auto in_splits_offsets_hdl  = c10d::symmetric_memory::rendezvous(in_splits_offsets, group_name);
   int rank = input_hdl->get_rank();
   int world_size = input_hdl->get_world_size();
   constexpr int NUM_TILES = THREADS_PER_BLOCK / A2AV_TILE_SIZE;
@@ -741,19 +822,18 @@ void all_to_all_vdev_2d_offset(
 
   int64_t major_align_val = 0;
 
-  void* input_ptr = input.data_ptr();
-  void* output_ptr = out.mutable_data_ptr();
-  int64_t* out_splits_offsets_ptr = (int64_t*)(out_splits_offsets.mutable_data_ptr());
-  int64_t* in_splits_offsets_ptr = (int64_t*)(in_splits_offsets.data_ptr());
+  void*    input_ptr              = input.data_ptr();
+  void*    output_ptr             = out.mutable_data_ptr();
+  int64_t* out_splits_offsets_ptr  = (int64_t*)(out_splits_offsets.mutable_data_ptr());
+  int64_t* in_splits_offsets_ptr   = (int64_t*)(in_splits_offsets.data_ptr());
 
   // Shape checks
   TORCH_CHECK(out_splits_offsets.is_contiguous()
       && in_splits_offsets.is_contiguous()
-      && input.is_contiguous()
-      && out.is_contiguous(),
+      && input.is_contiguous() && out.is_contiguous(),
       "input, out, in_splits_offsets and out_splits_offsets must be contiguous");
   auto out_split_shape = out_splits_offsets.sizes();
-  auto in_split_shape = in_splits_offsets.sizes();
+  auto in_split_shape  = in_splits_offsets.sizes();
   TORCH_CHECK(in_split_shape.size() == 2
       && in_split_shape[0] == 2
       && in_split_shape[1] % world_size == 0,
@@ -761,8 +841,7 @@ void all_to_all_vdev_2d_offset(
       "each row must be a multiple of world_size");
 
   // Consistency checks
-  TORCH_CHECK(input.dtype() == out.dtype()
-      && input.stride(0) == out.stride(0),
+  TORCH_CHECK(input.dtype() == out.dtype() && input.stride(0) == out.stride(0),
       "input and out must have the same dtype and same stride at dim 0");
   TORCH_CHECK(out_splits_offsets.scalar_type() == at::kLong
       && in_splits_offsets.scalar_type() == at::kLong,
@@ -771,14 +850,15 @@ void all_to_all_vdev_2d_offset(
   // Number of experts per rank
   int ne = in_split_shape[1] / world_size;
   // TODO: number of experts is currently limited by the number of elements in a WarpScan.
-  TORCH_CHECK(ne <= A2AV_TILE_SIZE, "Number of experts must be smaller than A2AV_TILE_SIZE", A2AV_TILE_SIZE);
+  TORCH_CHECK(ne <= A2AV_TILE_SIZE,
+      "Number of experts must be smaller than A2AV_TILE_SIZE", A2AV_TILE_SIZE);
 
   // Set device context for getting the stream and launching kernels below
   auto device = input.device();
-  TORCH_CHECK(device.type() == at::DeviceType::CUDA &&
-      out.device() == device &&
-      in_splits_offsets.device() == device &&
-      out_splits_offsets.device() == device,
+  TORCH_CHECK(device.type() == at::DeviceType::CUDA
+      && out.device() == device
+      && in_splits_offsets.device() == device
+      && out_splits_offsets.device() == device,
       "all tensor arguments must be on the same CUDA device");
   c10::cuda::CUDAGuard guard(device);
   auto stream = at::cuda::getCurrentCUDAStream();
@@ -786,37 +866,32 @@ void all_to_all_vdev_2d_offset(
   auto team = team_manager.get_team(group_name, input_hdl->get_rank_to_global_rank());
 
   // Exchange output splits and source offsets
-  auto input_dim0 = input.size(0);
+  auto input_dim0    = input.size(0);
   bool rank_is_row_in = false;
+
   exchangeSplitAndOffset_2d<true><<<dim3(1), dim3(THREADS_PER_BLOCK), 0, stream>>>(
-      in_splits_offsets_ptr,
-      out_splits_offsets_ptr,
-      team,
-      ne, input_dim0, rank_is_row_in);
+      in_splits_offsets_ptr, out_splits_offsets_ptr,
+      team, ne, input_dim0, rank_is_row_in);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   C10_CUDA_CHECK(hipStreamSynchronize(stream));
   rocshmem::rocshmem_barrier_all();
+
   // CTA Tuning
   // Naive for now, use 1 block per expert.
   // Total number of blocks is limited to 64 (intra-node) or 8 (inter-node).
-  int num_blocks = ::min(world_size * ne, world_size > 8 ? 8 : 64);
+  int num_blocks = std::min(world_size * ne, world_size > 8 ? 8 : 64);
 
   // Stride at dim 0
   size_t stride_bytes = input.stride(0) * input.element_size();
   bool rank_is_row_out = !rank_is_row_in;
 
+  // All to all data exchange
   allToAllV_2d<<<dim3(num_blocks), dim3(THREADS_PER_BLOCK), 0, stream>>>(
-      input_ptr,
-      output_ptr,
-      in_splits_offsets_ptr,
-      out_splits_offsets_ptr,
-      stride_bytes,
-      ne,
-      world_size,
-      major_align_val,
-      rank_is_row_out,
-      team);
+      input_ptr, output_ptr,
+      in_splits_offsets_ptr, out_splits_offsets_ptr,
+      stride_bytes, ne, world_size, major_align_val, rank_is_row_out, team);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  C10_CUDA_CHECK(hipStreamSynchronize(stream));
   writeOutputOffsets_2d<<<dim3(1), dim3(THREADS_PER_BLOCK), 0, stream>>>(
       out_splits_offsets_ptr, ne, world_size, major_align_val);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -825,14 +900,40 @@ void all_to_all_vdev_2d_offset(
 
 } // namespace c10d::nvshmem_extension
 
+// ---------------------------------------------------------------------------
+// rocSHMEM-specific extension (separate namespace for Python bindings)
+// ---------------------------------------------------------------------------
+
+namespace c10d::rocshmem_extension {
+
+bool is_rocshmem_available() {
+  // rocSHMEM is compiled in; always available when this library is loaded.
+  return true;
+}
+
+void rocshmem_hipmodule_init(uintptr_t module) {
+  auto hipmodule = reinterpret_cast<hipModule_t>(module);
+  NVSHMEM_CHECK(
+      ::rocshmem_hipmodule_init(hipmodule, nullptr),
+      "rocshmem_hipmodule_init failed");
+}
+
+} // namespace c10d::rocshmem_extension
+
+// ---------------------------------------------------------------------------
+// ATen operator registration (CUDA dispatch key covers HIP/ROCm builds too)
+// tile_reduce and multi_root_tile_reduce are NVSHMEM 3.3.9+ NVLS-only, not
+// available on ROCm.
+// ---------------------------------------------------------------------------
+
 TORCH_LIBRARY_IMPL(symm_mem, CUDA, m) {
-  m.impl("nvshmem_broadcast", c10d::nvshmem_extension::nvshmem_broadcast);
-  m.impl("nvshmem_put", c10d::nvshmem_extension::nvshmem_put);
-  m.impl("nvshmem_get", c10d::nvshmem_extension::nvshmem_get);
+  m.impl("nvshmem_broadcast",  c10d::nvshmem_extension::nvshmem_broadcast);
+  m.impl("nvshmem_put",        c10d::nvshmem_extension::nvshmem_put);
+  m.impl("nvshmem_get",        c10d::nvshmem_extension::nvshmem_get);
   m.impl("nvshmem_wait_for_signal", c10d::nvshmem_extension::nvshmem_wait_for_signal);
   m.impl("nvshmem_put_with_signal", c10d::nvshmem_extension::nvshmem_put_with_signal);
   m.impl("nvshmem_all_to_all", c10d::nvshmem_extension::nvshmem_all_to_all);
-  m.impl("all_to_all_vdev", c10d::nvshmem_extension::all_to_all_vdev);
+  m.impl("all_to_all_vdev",    c10d::nvshmem_extension::all_to_all_vdev);
   m.impl("all_to_all_vdev_2d", c10d::nvshmem_extension::all_to_all_vdev_2d);
   m.impl("all_to_all_vdev_2d_offset", c10d::nvshmem_extension::all_to_all_vdev_2d_offset);
 }

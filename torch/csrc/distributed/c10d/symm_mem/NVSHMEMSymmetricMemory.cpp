@@ -6,9 +6,25 @@
 #include <torch/csrc/distributed/c10d/symm_mem/nvshmem_team_manager.hpp>
 
 #include <ATen/ceil_div.h>
+#if defined(USE_ROCM)
+// On ROCm builds the c10/cuda/* headers chain into cuda_runtime_api.h which
+// is not present. Use the HIP equivalents directly. The HIP compiler's text
+// hipify pass does not run on these source files (HIP_COMPILER_unscanned),
+// so we provide the necessary CUDA→HIP API aliases explicitly.
+#include <ATen/hip/Exceptions.h>
+#include <c10/hip/HIPCachingAllocator.h>
+#include <c10/hip/HIPGuard.h>
+// CUDA runtime API aliases
+#define cudaMemcpy             hipMemcpy
+#define cudaMemcpyAsync        hipMemcpyAsync
+#define cudaMemset             hipMemset
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
+#define cudaFree               hipFree
+#else
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
+#endif
 #include <c10/util/error.h>
 
 #include <mutex>

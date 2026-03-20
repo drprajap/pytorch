@@ -17,6 +17,39 @@
 #include <host/nvshmemx_api.h>
 #else
 #include <rocshmem/rocshmem.hpp>
+
+// Map NVSHMEM types/constants to rocSHMEM equivalents.
+// These aliases allow NVSHMEMSymmetricMemory.cpp to compile unmodified under
+// the HIP compiler (which does not run PyTorch's text-based hipify pass on
+// these source files).
+using nvshmem_team_t = rocshmem_team_t;
+#define NVSHMEM_TEAM_INVALID ROCSHMEM_TEAM_INVALID
+#define NVSHMEM_TEAM_WORLD ROCSHMEM_TEAM_WORLD
+// Memory / pointer APIs
+#define nvshmem_malloc                  rocshmem_malloc
+#define nvshmem_free                    rocshmem_free
+#define nvshmem_ptr                     rocshmem_ptr
+// Init / uniqueid APIs
+using nvshmemx_uniqueid_t             = rocshmem_uniqueid_t;
+using nvshmemx_init_attr_t            = rocshmem_init_attr_t;
+#define nvshmemx_get_uniqueid           rocshmem_get_uniqueid
+#define nvshmemx_set_attr_uniqueid_args rocshmem_set_attr_uniqueid_args
+#define nvshmemx_init_attr              rocshmem_init_attr
+#define NVSHMEMX_INIT_WITH_UNIQUEID     ROCSHMEM_INIT_WITH_UNIQUEID
+
+// Wrapper: NVSHMEM passes void*/size_t for config; rocSHMEM uses rocshmem_team_config_t*/long.
+inline void nvshmem_team_split_strided(
+    rocshmem_team_t parent_team,
+    int start,
+    int stride,
+    int size,
+    const void* config,
+    size_t /*config_size*/,
+    rocshmem_team_t* new_team) {
+  rocshmem_team_split_strided(
+      parent_team, start, stride, size,
+      static_cast<const rocshmem_team_config_t*>(config), 0L, new_team);
+}
 #endif
 // For maximum compatibility, we use the "host/" style for now.
 

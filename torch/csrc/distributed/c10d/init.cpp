@@ -53,6 +53,9 @@
 
 #ifdef USE_NVSHMEM
 #include <torch/csrc/distributed/c10d/symm_mem/nvshmem_extension.hpp>
+#ifdef USE_ROCM
+#include <torch/csrc/distributed/c10d/symm_mem/rocshmem_extension.hpp>
+#endif
 #endif
 
 #include <torch/csrc/distributed/c10d/comm.hpp>
@@ -1031,6 +1034,21 @@ This class does not support ``__members__`` property.)");
   // Check if NVSHMEM is available on current system.
   module.def(
       "_is_nvshmem_available", ::c10d::nvshmem_extension::is_nvshmem_available);
+
+#ifdef USE_ROCM
+  // ROCm-specific: initializes the device state in a HIP module so that it
+  // can perform rocSHMEM operations. Exposed separately from the NVSHMEM
+  // binding so Python code can use the canonical rocSHMEM naming.
+  module.def(
+      "_rocshmem_hipmodule_init",
+      ::c10d::rocshmem_extension::rocshmem_hipmodule_init,
+      py::arg("module"));
+
+  // Check if rocSHMEM is available on current system.
+  module.def(
+      "_is_rocshmem_available",
+      ::c10d::rocshmem_extension::is_rocshmem_available);
+#endif
 #endif
 
   py::class_<::c10d::BroadcastOptions>(module, "BroadcastOptions")

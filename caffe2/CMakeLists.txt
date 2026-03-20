@@ -1497,11 +1497,13 @@ if(USE_ROCM)
       set_target_properties(torch_rocshmem PROPERTIES LINKER_LANGUAGE HIP)
 
       target_compile_definitions(torch_hip PUBLIC USE_NVSHMEM)
-      target_compile_definitions(torch_rocshmem PUBLIC USE_NVSHMEM USE_ROCM)
+      target_compile_definitions(torch_rocshmem PUBLIC USE_NVSHMEM USE_ROCM __HIP_PLATFORM_AMD__)
+
+      target_compile_options(torch_rocshmem PRIVATE -fgpu-rdc)
+      target_link_options(torch_rocshmem PRIVATE -fgpu-rdc)
 
       target_link_libraries(torch_rocshmem PRIVATE roc::rocshmem)
       target_link_libraries(torch_hip PRIVATE torch_rocshmem)
-
       install(TARGETS torch_rocshmem EXPORT Caffe2Targets DESTINATION
         "${TORCH_INSTALL_LIB_DIR}")
     else()

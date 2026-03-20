@@ -1,294 +1,286 @@
 # Owner(s): ["oncall: distributed"]
-# To run:
-# python test/distributed/test_nvshmem_triton.py
+#
+# ROCm / rocSHMEM Triton tests
+# TODO: Enable Collective device tests (alltoall, broadcast, team reduce)
+#       Currently these tests are skipped on ROCm because wg-scoped symbols are not 
+#       in rocSHMEM device bitcode;
+#       See torch/distributed/_symmetric_memory/_rocshmem_triton.py.
+#
+# Run (2 GPUs):
+#   HIP_VISIBLE_DEVICES=0,1 python -m pytest test/distributed/test_rocshmem_triton.py -v -k "not test_collective_device"
 
-import sys
+import unittest
+
 import torch
-
-# Import TEST_WITH_ROCM first to check for ROCm before importing NVSHMEM modules
-from torch.testing._internal.common_utils import TEST_WITH_ROCM
-
-
-# Skip entire module on ROCm before importing NVSHMEM-specific modules
-# NVSHMEM is NVIDIA-specific; on ROCm use test_rocshmem_triton.py instead.
-if TEST_WITH_ROCM or torch.version.hip is not None:
-    print("NVSHMEM not available on ROCm, skipping tests")
-    sys.exit(0)
-
-import triton.language as tl
-
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem
-from torch._inductor.runtime.triton_compat import triton
-from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem
 from torch.testing._internal.common_distributed import MultiProcContinuousTest
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
     run_tests,
     skip_but_pass_in_sandcastle_if,
-    skipIfRocm,
 )
-from torch.testing._internal.inductor_utils import IS_H100, requires_triton
+from torch.utils._triton import has_triton
 
-
-if not symm_mem.is_nvshmem_available():
-    print("NVSHMEM not available, skipping tests")
-    sys.exit(0)
-
-
-def requires_h100():
-    return skip_but_pass_in_sandcastle_if(
-        not IS_H100,
-        "NVSHMEM requires H100. Skipping test on non-H100 GPU.",
-    )
-
-
-# So that tests are written in device-agnostic way
 device_type = "cuda"
 device_module = torch.get_device_module(device_type)
 
 
-# Shared Triton JIT kernels
+def requires_rocshmem_available():
+    on_rocm = torch.version.hip is not None
+    return skip_but_pass_in_sandcastle_if(
+        not on_rocm or not symm_mem.is_nvshmem_available(),
+        "test requires ROCm build with rocSHMEM",
+    )
 
 
-@requires_nvshmem
-@triton.jit
-def my_put_kernel(
-    dest,
-    src,
-    nelems,
-    pe,
-):
-    nvshmem.put(dest, src, nelems, pe)
+if has_triton() and torch.version.hip is not None:
+    import triton.language as tl
+    import torch.distributed._symmetric_memory._rocshmem_triton as rocshmem
+    from torch._inductor.runtime.triton_compat import triton
+    from torch.testing._internal.inductor_utils import requires_triton
+    from torch.distributed._symmetric_memory._rocshmem_triton import requires_rocshmem
 
+    # Shared Triton JIT kernels
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_put_kernel(
+        dest,
+        src,
+        nelems,
+        pe,
+    ):
+        rocshmem.put(dest, src, nelems, pe)
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_get_kernel(
+        dest,
+        src,
+        nelems,
+        pe,
+        nbi: tl.constexpr,  # use nonblocking interface if True
+    ):
+        if nbi:
+            rocshmem.get_nbi(dest, src, nelems, pe)
+            rocshmem.quiet()
+        else:
+            rocshmem.get(dest, src, nelems, pe)
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_putmem_signal_block_kernel(
+        dst,
+        src,
+        size_bytes,
+        signal,
+        sig_val,
+        sig_op,
+        peer,
+    ):
+        rocshmem.putmem_signal_block(dst, src, size_bytes, signal, sig_val, sig_op, peer)
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_signal_wait_until_kernel(signal, cmp_op, cmp_val):
+        rocshmem.signal_wait_until(signal, cmp_op, cmp_val)
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_signal_op_kernel(
+        sig_addr,
+        signal,
+        sig_op,
+        peer,
+    ):
+        rocshmem.signal_op(sig_addr, signal, sig_op, peer)
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_wait_until_kernel(
+        ivar,
+        cmp_op,
+        cmp_val,
+    ):
+        rocshmem.wait_until(ivar, cmp_op, cmp_val)
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_fence_kernel():
+        rocshmem.fence()
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_put_with_fence_kernel(
+        dst1,
+        src1,
+        dst2,
+        src2,
+        flag_dst,
+        flag_src,
+        nelems,
+        peer,
+    ):
+        # First put
+        rocshmem.put(dst1, src1, nelems, peer)
+        # Ensure the first put is ordered before the next.
+        rocshmem.fence()
+        # Second put
+        rocshmem.put(dst2, src2, nelems, peer)
+        # Order the second put before flag update.
+        rocshmem.fence()
+        # Write the flag (single int64) to signal completion.
+        rocshmem.put(flag_dst, flag_src, 1, peer)
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_put_with_quiet_kernel(
+        dst,
+        src,
+        flag_dst,
+        flag_src,
+        nelems,
+        peer,
+    ):
+        # Put data
+        rocshmem.put(dst, src, nelems, peer)
+        # Call quiet to ensure put is complete
+        rocshmem.quiet()
+        # Only after quiet, set the completion flag
+        # This ensures the data put is complete before flag is set
+        rocshmem.put(flag_dst, flag_src, 1, peer)
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_barrier_test_kernel(
+        dst,
+        src,
+        nelems,
+    ):
+        # Testing barrier_all() requires coordinated operations across PEs within
+        # the same kernel execution. Unlike other kernels that just wrap NVSHMEM
+        # primitives, this one implements the full test logic to properly verify
+        # device-side barrier synchronization.
+        my_pe = rocshmem.my_pe()
+        n_pes = rocshmem.n_pes()
+    
+        # Rank 0 broadcasts its value to all other ranks
+        if my_pe == 0:
+            # Write initial value
+            p_src = src.to(tl.pointer_type(tl.int32))
+            tl.store(p_src, 42)
+            # Put to all other ranks
+            i = 1
+            while i < n_pes:
+                rocshmem.put(dst, src, nelems, i)
+                i += 1
+    
+        # Synchronize all PEs
+        rocshmem.barrier_all()
+    
+        # Non-zero ranks increment the received value
+        if my_pe != 0:
+            p_dst = dst.to(tl.pointer_type(tl.int32))
+            received = tl.load(p_dst)
+            tl.store(p_dst, received + 1)
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_barrier_all_kernel():
+        rocshmem.barrier_all()
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_sync_test_kernel(
+        local_data,
+        remote_data,
+        nelems,
+    ):
+        my_pe = rocshmem.my_pe()
+        n_pes = rocshmem.n_pes()
+    
+        # Each PE writes a unique value to its local memory
+        p_local = local_data.to(tl.pointer_type(tl.int32))
+        unique_value = my_pe + 100  # PE 0 writes 100, PE 1 writes 101, etc.
+        tl.store(p_local, unique_value)
+    
+        # sync_all() ensures local stores are visible to other PEs
+        # but doesn't guarantee completion of any remote operations
+        rocshmem.sync_all()
+    
+        # Now each PE reads from the next PE's memory to verify visibility
+        # PE 0 reads from PE 1, PE 1 reads from PE 2, ..., PE n-1 reads from PE 0
+        next_pe = (my_pe + 1) % n_pes
+        rocshmem.get(remote_data, local_data, nelems, next_pe)
+    
+        # The get should now see the value that the next PE wrote locally
+        # because sync_all() made those local stores visible
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_alltoall_kernel(
+        team_handle,
+        dst,
+        src,
+        nelems_per_pe,
+    ):
+        rocshmem.alltoall(team_handle, dst, src, nelems_per_pe)
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_broadcast_kernel(
+        team_handle,
+        dst,
+        src,
+        nelems,
+        pe_root,
+    ):
+        rocshmem.broadcast(team_handle, dst, src, nelems, pe_root)
+    
+    
+    @requires_rocshmem
+    @triton.jit
+    def my_reduce_kernel(
+        team_handle,
+        dest_tensor,
+        source_tensor,
+        nreduce,
+        operation: tl.constexpr,
+    ):
+        rocshmem.reduce(team_handle, dest_tensor, source_tensor, nreduce, operation)
+    
+    
 
-@requires_nvshmem
-@triton.jit
-def my_get_kernel(
-    dest,
-    src,
-    nelems,
-    pe,
-    nbi: tl.constexpr,  # use nonblocking interface if True
-):
-    if nbi:
-        nvshmem.get_nbi(dest, src, nelems, pe)
-        nvshmem.quiet()
-    else:
-        nvshmem.get(dest, src, nelems, pe)
-
-
-@requires_nvshmem
-@triton.jit
-def my_putmem_signal_block_kernel(
-    dst,
-    src,
-    size_bytes,
-    signal,
-    sig_val,
-    sig_op,
-    peer,
-):
-    nvshmem.putmem_signal_block(dst, src, size_bytes, signal, sig_val, sig_op, peer)
-
-
-@requires_nvshmem
-@triton.jit
-def my_signal_wait_until_kernel(signal, cmp_op, cmp_val):
-    nvshmem.signal_wait_until(signal, cmp_op, cmp_val)
-
-
-@requires_nvshmem
-@triton.jit
-def my_signal_op_kernel(
-    sig_addr,
-    signal,
-    sig_op,
-    peer,
-):
-    nvshmem.signal_op(sig_addr, signal, sig_op, peer)
-
-
-@requires_nvshmem
-@triton.jit
-def my_wait_until_kernel(
-    ivar,
-    cmp_op,
-    cmp_val,
-):
-    nvshmem.wait_until(ivar, cmp_op, cmp_val)
-
-
-@requires_nvshmem
-@triton.jit
-def my_fence_kernel():
-    nvshmem.fence()
-
-
-@requires_nvshmem
-@triton.jit
-def my_put_with_fence_kernel(
-    dst1,
-    src1,
-    dst2,
-    src2,
-    flag_dst,
-    flag_src,
-    nelems,
-    peer,
-):
-    # First put
-    nvshmem.put(dst1, src1, nelems, peer)
-    # Ensure the first put is ordered before the next.
-    nvshmem.fence()
-    # Second put
-    nvshmem.put(dst2, src2, nelems, peer)
-    # Order the second put before flag update.
-    nvshmem.fence()
-    # Write the flag (single int64) to signal completion.
-    nvshmem.put(flag_dst, flag_src, 1, peer)
-
-
-@requires_nvshmem
-@triton.jit
-def my_put_with_quiet_kernel(
-    dst,
-    src,
-    flag_dst,
-    flag_src,
-    nelems,
-    peer,
-):
-    # Put data
-    nvshmem.put(dst, src, nelems, peer)
-    # Call quiet to ensure put is complete
-    nvshmem.quiet()
-    # Only after quiet, set the completion flag
-    # This ensures the data put is complete before flag is set
-    nvshmem.put(flag_dst, flag_src, 1, peer)
-
-
-@requires_nvshmem
-@triton.jit
-def my_barrier_test_kernel(
-    dst,
-    src,
-    nelems,
-):
-    # Testing barrier_all() requires coordinated operations across PEs within
-    # the same kernel execution. Unlike other kernels that just wrap NVSHMEM
-    # primitives, this one implements the full test logic to properly verify
-    # device-side barrier synchronization.
-    my_pe = nvshmem.my_pe()
-    n_pes = nvshmem.n_pes()
-
-    # Rank 0 broadcasts its value to all other ranks
-    if my_pe == 0:
-        # Write initial value
-        p_src = src.to(tl.pointer_type(tl.int32))
-        tl.store(p_src, 42)
-        # Put to all other ranks
-        i = 1
-        while i < n_pes:
-            nvshmem.put(dst, src, nelems, i)
-            i += 1
-
-    # Synchronize all PEs
-    nvshmem.barrier_all()
-
-    # Non-zero ranks increment the received value
-    if my_pe != 0:
-        p_dst = dst.to(tl.pointer_type(tl.int32))
-        received = tl.load(p_dst)
-        tl.store(p_dst, received + 1)
-
-
-@requires_nvshmem
-@triton.jit
-def my_barrier_all_kernel():
-    nvshmem.barrier_all()
-
-
-@requires_nvshmem
-@triton.jit
-def my_sync_test_kernel(
-    local_data,
-    remote_data,
-    nelems,
-):
-    my_pe = nvshmem.my_pe()
-    n_pes = nvshmem.n_pes()
-
-    # Each PE writes a unique value to its local memory
-    p_local = local_data.to(tl.pointer_type(tl.int32))
-    unique_value = my_pe + 100  # PE 0 writes 100, PE 1 writes 101, etc.
-    tl.store(p_local, unique_value)
-
-    # sync_all() ensures local stores are visible to other PEs
-    # but doesn't guarantee completion of any remote operations
-    nvshmem.sync_all()
-
-    # Now each PE reads from the next PE's memory to verify visibility
-    # PE 0 reads from PE 1, PE 1 reads from PE 2, ..., PE n-1 reads from PE 0
-    next_pe = (my_pe + 1) % n_pes
-    nvshmem.get(remote_data, local_data, nelems, next_pe)
-
-    # The get should now see the value that the next PE wrote locally
-    # because sync_all() made those local stores visible
-
-
-@requires_nvshmem
-@triton.jit
-def my_alltoall_kernel(
-    team_handle,
-    dst,
-    src,
-    nelems_per_pe,
-):
-    nvshmem.alltoall(team_handle, dst, src, nelems_per_pe)
-
-
-@requires_nvshmem
-@triton.jit
-def my_broadcast_kernel(
-    team_handle,
-    dst,
-    src,
-    nelems,
-    pe_root,
-):
-    nvshmem.broadcast(team_handle, dst, src, nelems, pe_root)
-
-
-@requires_nvshmem
-@triton.jit
-def my_reduce_kernel(
-    team_handle,
-    dest_tensor,
-    source_tensor,
-    nreduce,
-    operation: tl.constexpr,
-):
-    nvshmem.reduce(team_handle, dest_tensor, source_tensor, nreduce, operation)
-
-
+@requires_rocshmem_available()
 @instantiate_parametrized_tests
-class NVSHMEMTritonTest(MultiProcContinuousTest):
+class ROCSHMEMTritonTest(MultiProcContinuousTest):
     def _init_device(self) -> None:
         # TODO: relieve this (seems to hang if without)
         device_module.set_device(self.device)
-        # Set NVSHMEM as SymmMem backend
+        # NVSHMEM symmetric memory backend
         symm_mem.set_backend("NVSHMEM")
 
     @property
     def device(self) -> torch.device:
         return torch.device(device_type, self.rank)
 
-    @skipIfRocm
     @requires_triton()
-    @requires_h100()
     def test_triton_put(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -338,9 +330,7 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
                 dst, torch.tensor(expected, device=self.device, dtype=dtype)
             )
 
-    @skipIfRocm
     @requires_triton()
-    @requires_h100()
     @parametrize("nbi", [False, True])  # Test both blocking and nonblocking interfaces
     def test_triton_get(self, nbi: bool) -> None:
         torch.manual_seed(42 + self.rank)
@@ -378,9 +368,7 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
                 out, val * torch.ones(numel, dtype=dtype, device=self.device)
             )
 
-    @skipIfRocm
     @requires_triton()
-    @requires_h100()
     def test_triton_get_ring(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -419,9 +407,7 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
             out, expected_value * torch.ones(numel, dtype=dtype, device=self.device)
         )
 
-    @skipIfRocm
     @requires_triton()
-    @requires_h100()
     def test_triton_put_signal_set(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -476,9 +462,7 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
                 flag, torch.tensor([SIGNAL_VAL], dtype=torch.int64, device=self.device)
             )
 
-    @skipIfRocm
     @requires_triton()
-    @requires_h100()
     def test_triton_put_signal_add(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -531,9 +515,7 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
                 flag, torch.tensor([SIGNAL_VAL], dtype=torch.int64, device=self.device)
             )
 
-    @skipIfRocm
     @requires_triton()
-    @requires_h100()
     def test_triton_wait_until(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -579,9 +561,7 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
                 peer,  # The target PE (Rank 0)
             )
 
-    @skipIfRocm
     @requires_triton()
-    @requires_h100()
     def test_triton_signal_wait_until(self) -> None:
         self._init_device()
         group_name = dist.distributed_c10d._get_default_group().group_name
@@ -639,9 +619,7 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
                 ),
             )
 
-    @skipIfRocm
     @requires_triton()
-    @requires_h100()
     def test_triton_fence(self) -> None:
         """
         Rank 0 performs two put operations into Rank 1's buffers with a fence
@@ -711,9 +689,7 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
                 flag, torch.tensor([flag_val], dtype=torch.int32, device=self.device)
             )
 
-    @skipIfRocm
     @requires_triton()
-    @requires_h100()
     def test_triton_quiet(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -760,9 +736,7 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
             )
         dist.barrier()
 
-    @skipIfRocm
     @requires_triton()
-    @requires_h100()
     def test_triton_barrier(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -794,9 +768,7 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
                 dst, torch.tensor([43], device=self.device, dtype=dtype)
             )
 
-    @skipIfRocm
     @requires_triton()
-    @requires_h100()
     def test_triton_sync(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -837,9 +809,10 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
             torch.tensor([expected_remote], device=self.device, dtype=dtype),
         )
 
-    @skipIfRocm
+    @unittest.skip(
+        "rocSHMEM device bitcode has no wg-scoped alltoall; see _nvshmem_triton.py"
+    )
     @requires_triton()
-    @requires_h100()
     def test_triton_alltoall(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -883,9 +856,10 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
             actual = dst[i * nelems_per_pe : (i + 1) * nelems_per_pe]
             torch.testing.assert_close(actual, torch.full_like(actual, expected))
 
-    @skipIfRocm
+    @unittest.skip(
+        "rocSHMEM device bitcode has no wg-scoped broadcast; see _nvshmem_triton.py"
+    )
     @requires_triton()
-    @requires_h100()
     def test_triton_broadcast(self) -> None:
         torch.manual_seed(42 + self.rank)
         self._init_device()
@@ -936,9 +910,10 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
             dst, torch.tensor(expected, device=self.device, dtype=dtype)
         )
 
-    @skipIfRocm
+    @unittest.skip(
+        "rocSHMEM device bitcode has no wg-scoped team reduce; see _nvshmem_triton.py"
+    )
     @requires_triton()
-    @requires_h100()
     @parametrize(
         "dtype",
         [
@@ -998,9 +973,10 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
             dst, torch.tensor(expected, device=self.device, dtype=dtype)
         )
 
-    @skipIfRocm
+    @unittest.skip(
+        "rocSHMEM device bitcode has no wg-scoped team reduce; see _nvshmem_triton.py"
+    )
     @requires_triton()
-    @requires_h100()
     @parametrize(
         "dtype",
         [
@@ -1083,9 +1059,10 @@ class NVSHMEMTritonTest(MultiProcContinuousTest):
             dst_max, torch.tensor(expected_max, device=self.device, dtype=dtype)
         )
 
-    @skipIfRocm
+    @unittest.skip(
+        "rocSHMEM device bitcode has no wg-scoped team reduce; see _nvshmem_triton.py"
+    )
     @requires_triton()
-    @requires_h100()
     @parametrize(
         "dtype",
         [
