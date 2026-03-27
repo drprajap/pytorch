@@ -1,9 +1,9 @@
+#include "hip/hip_runtime.h"
 // rocSHMEM implementation of c10d::nvshmem_extension (see nvshmem_extension.hpp).
 // Algorithm and comments follow nvshmem_extension.cu / PyTorch PR #173518; ROCm uses
 // plain kernel launches, hipStreamSynchronize + rocshmem_barrier_all where NVSHMEM
 // uses collective launch, and separate writeOutputOffsets* kernels (no grid-wide sync).
-// This TU links into torch_rocshmem only. The trailing c10d::rocshmem_extension
-// symbols support Triton (_rocshmem_hipmodule_init); not present in the PR file alone.
+// This TU is built into torch_rocshmem; extra symbols are kept for Triton init.
 
 #include <algorithm>
 #include <vector>
@@ -760,7 +760,7 @@ void all_to_all_vdev_2d(
   // CTA Tuning
   // Naive for now, use 1 block per expert.
   // Total number of blocks is limited to 64 (intra-node) or 8 (inter-node).
-  int num_blocks = std::min(world_size * ne, world_size > 8 ? 8 : 64);
+  int num_blocks = ::min(world_size * ne, world_size > 8 ? 8 : 64);
 
   // Stride at dim 0
   size_t stride_bytes = input.stride(0) * input.element_size();
@@ -879,7 +879,7 @@ void all_to_all_vdev_2d_offset(
   // CTA Tuning
   // Naive for now, use 1 block per expert.
   // Total number of blocks is limited to 64 (intra-node) or 8 (inter-node).
-  int num_blocks = std::min(world_size * ne, world_size > 8 ? 8 : 64);
+  int num_blocks = ::min(world_size * ne, world_size > 8 ? 8 : 64);
 
   // Stride at dim 0
   size_t stride_bytes = input.stride(0) * input.element_size();

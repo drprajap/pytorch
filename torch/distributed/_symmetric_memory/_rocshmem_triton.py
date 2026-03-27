@@ -9,9 +9,14 @@ integration in _nvshmem_triton.py.  It is only imported on ROCm builds
 import logging
 import os
 import sysconfig
-from typing import Any
 
 import torch
+from torch.distributed._symmetric_memory._shmem_triton import (
+    ShmemKernelRegistry,
+    build_requires_shmem_decorator,
+    find_library_with_env_and_paths,
+    run_shmem_init_hook,
+)
 from torch.utils._triton import has_triton
 
 
@@ -50,55 +55,34 @@ class RocshmemLibFinder:
 
         lib_name = f"librocshmem_device_{arch}.bc"
 
-        user_lib_dir = os.environ.get("ROCSHMEM_LIB_DIR")
-        if user_lib_dir is not None:
-            lib_path = os.path.join(user_lib_dir, lib_name)
-            if not os.path.exists(lib_path):
-                raise RuntimeError(
-                    f"rocSHMEM device library not found at ROCSHMEM_LIB_DIR: "
-                    f"{lib_path}"
-                )
-            cls.found_device_lib_path = lib_path
-            return lib_path
-
         search_paths = [
             os.path.join(sysconfig.get_path("purelib"), "amd", "rocshmem", "lib"),
             "/opt/rocm/lib",
-            "/opt/rocm-7.1.0/lib",
             "/usr/local/lib",
             "/usr/lib",
         ]
 
-        for path in search_paths:
-            candidate = os.path.join(path, lib_name)
-            if os.path.exists(candidate):
-                logger.info("Found rocSHMEM device library: %s", candidate)
-                cls.found_device_lib_path = candidate
-                return candidate
-
-        raise RuntimeError(
-            f"rocSHMEM device library '{lib_name}' not found.\n"
-            f"Searched: {search_paths}\n"
-            f"Set ROCSHMEM_LIB_DIR to the directory containing it."
+        lib_path = find_library_with_env_and_paths(
+            env_var="ROCSHMEM_LIB_DIR",
+            file_name=lib_name,
+            search_paths=search_paths,
+            env_path_not_found_msg=lambda p: (
+                "rocSHMEM device library not found at ROCSHMEM_LIB_DIR: "
+                f"{p}"
+            ),
+            not_found_msg=lambda searched: (
+                f"rocSHMEM device library '{lib_name}' not found.\n"
+                f"Searched: {searched}\n"
+                "Set ROCSHMEM_LIB_DIR to the directory containing it."
+            ),
         )
+        logger.info("Found rocSHMEM device library: %s", lib_path)
+        cls.found_device_lib_path = lib_path
+        return lib_path
 
 
-class RocshmemKernelRegistry:
+class RocshmemKernelRegistry(ShmemKernelRegistry):
     """Track Triton kernels that need rocSHMEM HIP-module initialization."""
-
-    _to_init: dict[str, Any] = {}
-
-    @classmethod
-    def register(cls, name: str) -> None:
-        cls._to_init.setdefault(name)
-
-    @classmethod
-    def deregister(cls, name: str) -> None:
-        cls._to_init.pop(name, None)
-
-    @classmethod
-    def has(cls, name: str) -> bool:
-        return name in cls._to_init
 
 
 def _rocshmem_init_hook(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
@@ -123,47 +107,18 @@ def _rocshmem_init_hook(*args, **kwargs) -> None:  # type: ignore[no-untyped-def
             "PyTorch must be built with USE_ROCM=1 and rocSHMEM installed."
         ) from e
 
-    jit_function = kwargs["fn"].jit_function
-    fn_name = jit_function.fn.__name__
-
-    if not RocshmemKernelRegistry.has(fn_name):
-        return
-
-    key = kwargs["key"]
-    device = kwargs["compile"]["device"]
-    kernel_cache = jit_function.device_caches[device][0]
-    kernel = kernel_cache.get(key, None)
-    if kernel is not None:
-        kernel.run  # noqa: B018 — touch the JIT cache entry
-        _rocshmem_hipmodule_init(kernel.module)
-    else:
-        logger.warning(
-            "It seems Triton hasn't created a kernel for function %s. "
-            "Please report this issue to Triton.",
-            fn_name,
-        )
+    run_shmem_init_hook(
+        kwargs=kwargs,
+        registry=RocshmemKernelRegistry,
+        module_init=_rocshmem_hipmodule_init,
+        logger=logger,
+    )
 
 
 if has_triton():
     import triton
     import triton.language as tl
     from triton.language import core
-    from triton.runtime.jit import JITFunction, KernelInterface
-
-    class GridCallableWithExtern(KernelInterface):
-        """
-        ``KernelInterface`` invokes ``self.run`` in ``__getitem__``, i.e. [].
-        We implement a ``run`` method by directing the call to
-        ``JITFunction.run``, with added ``extern_libs`` kwarg, so that users
-        don't have to pass it.
-        """
-
-        def __init__(self, jit_func: JITFunction, extern_libs: dict[str, str]) -> None:
-            self.jit_func = jit_func
-            self.extern_libs = extern_libs
-
-        def run(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-            return self.jit_func.run(*args, **kwargs, extern_libs=self.extern_libs)
 
     def requires_rocshmem(  # type: ignore[no-untyped-def]
         jit_func,
@@ -185,22 +140,14 @@ if has_triton():
 
         Set ``ROCSHMEM_LIB_DIR`` to override the default library search path.
         """
-        if not isinstance(jit_func, JITFunction):
-            raise TypeError(
-                f"@requires_rocshmem must be applied to a @triton.jit function, "
-                f"got {type(jit_func)}"
-            )
-
-        lib_path = RocshmemLibFinder.find_device_library()
-        # Key must be a substring of the rocSHMEM device function names
-        # (e.g. "rocshmem_my_pe") so that amd.need_extern_lib() returns True
-        # and the bitcode is actually linked into the Triton kernel.
-        extern_libs = {"rocshmem": lib_path}
-
-        RocshmemKernelRegistry.register(jit_func.fn.__name__)
-        triton.knobs.runtime.jit_post_compile_hook = _rocshmem_init_hook
-
-        return GridCallableWithExtern(jit_func, extern_libs)
+        return build_requires_shmem_decorator(
+            jit_func=jit_func,
+            find_device_library=RocshmemLibFinder.find_device_library,
+            extern_libs_key="rocshmem",
+            registry=RocshmemKernelRegistry,
+            init_hook=_rocshmem_init_hook,
+            error_prefix="@requires_rocshmem",
+        )
 
     # -----------------------------------------------------------------------
     # rocSHMEM device API — Triton-callable device functions.
@@ -331,7 +278,7 @@ if has_triton():
 
     @triton.jit
     def signal_op(sig_addr, signal, sig_op, pe):  # type: ignore[no-untyped-def]
-        """Not available in rocSHMEM device bitcode."""
+        """Not available in current rocSHMEM device bitcode."""
         tl.static_assert(
             False,
             "rocshmem has no device-bitcode equivalent for signal_op. "
@@ -340,7 +287,7 @@ if has_triton():
 
     @core.extern
     def fence(_semantic=None):  # type: ignore[no-untyped-def]
-        """Ensure ordering of put operations to each remote PE."""
+        """Ensure ordering of issued remote-memory operations to each target PE."""
         return core.extern_elementwise(
             "", "", [],
             {(): ("rocshmem_fence", core.dtype("int32"))},
@@ -349,7 +296,7 @@ if has_triton():
 
     @core.extern
     def quiet(_semantic=None):  # type: ignore[no-untyped-def]
-        """Wait for completion of all outstanding put operations."""
+        """Wait for completion of all outstanding remote-memory operations."""
         return core.extern_elementwise(
             "", "", [],
             {(): ("rocshmem_quiet", core.dtype("int32"))},
@@ -392,31 +339,32 @@ if has_triton():
             is_pure=False, _semantic=_semantic,
         )
 
-    # Collective stubs — wg-scoped variants not in rocSHMEM device bitcode yet.
+    # Collective stubs: rocSHMEM *_wg collectives are not exposed in current
+    # device bitcode, so Triton kernels cannot call them yet.
 
     @triton.jit
     def alltoall(team, dest, source, nelems_per_pe):  # type: ignore[no-untyped-def]
-        """Not available: rocshmem_alltoallmem_wg is not in the device bitcode."""
+        """Not available: rocshmem_alltoallmem_wg is not in current device bitcode."""
         tl.static_assert(
             False,
-            "rocshmem_alltoallmem_wg is not available in the device bitcode. "
+            "rocshmem_alltoallmem_wg is not available in current device bitcode. "
             "Use host-side rocshmem_alltoallmem_on_stream instead.",
         )
 
     @triton.jit
     def broadcast(team, dest, source, nelems, pe_root):  # type: ignore[no-untyped-def]
-        """Not available: rocshmem_broadcastmem_wg is not in the device bitcode."""
+        """Not available: rocshmem_broadcastmem_wg is not in current device bitcode."""
         tl.static_assert(
             False,
-            "rocshmem_broadcastmem_wg is not available in the device bitcode. "
+            "rocshmem_broadcastmem_wg is not available in current device bitcode. "
             "Use host-side rocshmem_broadcastmem_on_stream instead.",
         )
 
     @triton.jit
     def reduce(team, dest, source, nreduce, operation: tl.constexpr):  # type: ignore[no-untyped-def]
-        """Not available: rocshmem team reduce wg ops are not in the device bitcode."""
+        """Not available: rocshmem team reduce wg ops are not in current device bitcode."""
         tl.static_assert(
             False,
-            "rocshmem team reduce is not available in the device bitcode. "
+            "rocshmem team reduce is not available in current device bitcode. "
             "Use host-side rocshmem reduce API instead.",
         )
